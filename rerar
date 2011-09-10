@@ -1,7 +1,6 @@
 #! /usr/bin/env python3
 
 USE_NUMPY = True
-USE_ARRAY = True
 
 # Optimum values possibly depend on speed of Python and cache sizes and
 # characteristics
@@ -14,13 +13,16 @@ from rarfile import (
     S_BLK_HDR, S_FILE_HDR, S_SHORT, S_LONG,
     RAR_ID,
     RAR_BLOCK_MAIN, RAR_BLOCK_FILE, RAR_BLOCK_SUB, RAR_BLOCK_ENDARC,
+    RAR_BLOCK_OLD_RECOVERY,
     RAR_LONG_BLOCK, RAR_SKIP_IF_UNKNOWN,
-    RAR_MAIN_VOLUME, RAR_MAIN_RECOVERY, RAR_MAIN_FIRSTVOLUME,
-    RAR_FILE_SPLIT_BEFORE, RAR_FILE_SPLIT_AFTER, RAR_FILE_DICT4096,
+    RAR_MAIN_VOLUME, RAR_MAIN_RECOVERY, RAR_MAIN_FIRSTVOLUME, RAR_MAIN_LOCK,
+    RAR_MAIN_NEWNUMBERING,
+    RAR_FILE_SPLIT_BEFORE, RAR_FILE_SPLIT_AFTER, RAR_FILE_DICTMASK,
+    RAR_FILE_DICT256, RAR_FILE_DICT4096, RAR_FILE_LARGE, RAR_FILE_SALT,
     RAR_FILE_UNICODE, RAR_FILE_EXTTIME,
     RAR_ENDARC_NEXT_VOLUME, RAR_ENDARC_DATACRC, RAR_ENDARC_REVSPACE,
     RAR_ENDARC_VOLNR,
-    RAR_OS_WIN32,
+    RAR_OS_WIN32, RAR_OS_UNIX,
 )
 
 import sys
@@ -32,25 +34,24 @@ import io
 import math
 
 if USE_NUMPY:
-    try: import numpy
-    except ImportError: USE_NUMPY = False
-if not USE_NUMPY and USE_ARRAY: import array
+    try:
+        import numpy
+    except ImportError:
+        USE_NUMPY = False
+if not USE_NUMPY:
+    import array
 
 def main():
-    # size 15M => Rar volume size. M specifies units of 10^6. Default is 15M. (TODO: Use scene rules for default.)
     # srr => Produce rescene file rather than Rar files
     # srr-rr-full => Do not strip Rar recovery records (older SRR file format). Requires srr and one of the rr options.
-    # rr-old => Produce older Rar recovery records
-    # internal name-grp.avi => Name to be used for the data file inside the Rar set. Defaults to the external file name, without any directory components.
     # volume => Explicitly specify first, second, etc full volume name. Default is ".partN.rar" for "new" Rar 3 naming scheme, where the number of digits is automatically determined by the total number of volumes; and ".rar", ".r00", ".r01", etc, ".r99", ".s00", etc, ".s99" or ".001", ".002", etc, for the "old" naming scheme.
     # base => Base output name, appended with ".sfv", ".partN" and/or ".rar" as appropriate. Default is the base name of the data file internal name with extension removed.
-    # naming-new => Force "new" Rar 3 volume naming scheme
     # naming-old => Force "old" volume naming scheme
     # Default: Automatically choose "old" or "new" Rar 3 volume naming scheme depending on the number of volumes needed. More than 101 invokes the "new" Rar 3 scheme.
     # Option to only do the first volume, the first few volumes, or any given set of volumes?
     
     help = False
-    file = None
+    file = ""
     intname = None
     vol_max = 15 * 10 ** 6
     timestamp = None
@@ -58,6 +59,18 @@ def main():
     is_rr = False
     is_unicode = False
     newline = "\r\n"
+    naming_version = None
+    is_lock = False
+    ref = None
+    rls_name = None
+    sfvhead = ""
+    end_flags = RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR
+    attr = 1 << ATTR_ARCHIVE
+    dict = None
+    version = 3
+    host_os = RAR_OS_WIN32
+    lenient = False
+    overwrite = False
     
     i = 1
     while i < len(sys.argv):
@@ -86,31 +99,469 @@ def main():
         elif "internal" == arg:
             intname = sys.argv[i + 1]
             i += 2
-        else: raise SystemExit("""Bad command line argument: "{}".
-Try "{} help".""".format(arg, sys.argv[0]))
+        elif "naming2" == arg:
+            naming_version = 2
+            i += 1
+        elif "naming3" == arg:
+            naming_version = 3
+            i += 1
+        elif "lock" == arg:
+            is_lock = True
+            i += 1
+        elif "ref" == arg:
+            ref = sys.argv[i + 1]
+            i += 2
+        elif "crcrlf" == arg:
+            newline = "\r\r\n"
+            i += 1
+        elif "sfvhead" == arg:
+            sfvhead = sys.argv[i + 1]
+            if sfvhead and "\n" != sfvhead[-1]:
+                sfvhead += "\n"
+            i += 2
+        elif "nonum" == arg:
+            end_flags &= ~RAR_ENDARC_VOLNR
+            i += 1
+        elif "blankend" == arg:
+            end_flags = 0
+            i += 1
+        elif "normalattr" == arg:
+            attr = 1 << ATTR_NORMAL
+            i += 1
+        elif "dict" == arg:
+            dict = int(sys.argv[i + 1])
+            
+            if not DICT_MIN <= dict <= DICT_MAX:
+                raise SystemExit("Dictionary size {} out of {}-{} range".
+                    format(dict, DICT_MIN, DICT_MAX))
+            log = math.log(dict / DICT_MIN)
+            ilog = int(log)
+            if ilog != log:
+                raise SystemExit("Dictionary size {} not a round binary".
+                    format(dict))
+            dict = ilog << DICT_POS
+            
+            i += 2
+        elif "rar2" == arg:
+            version = 2
+            i += 1
+        elif "size" == arg:
+            vol_max = int(sys.argv[i + 1])
+            i += 2
+        elif "unix" == arg:
+            host_os = RAR_OS_UNIX
+            i += 1
+        elif "lenient" == arg:
+            lenient = True
+            i += 1
+        elif "overwrite" == arg:
+            overwrite = True
+            i += 1
+        else:
+            raise SystemExit('''Bad command line argument: {}
+Try "{} help"'''.format(arg, sys.argv[0]))
     
     if help:
         print("""\
 Options:
 help\tDisplay this help
 file <grp-name.avi>
-\tSpecify data file (Mandatory)
+\tSpecify data file. If directory only is specified, append internal name.
+ref <grp-name.rar>
+\tRead settings from existing Rar file
 internal <grp-name.avi>
 \tName to be used for the data file inside the Rar set. Defaults to the
 \texternal file name, without any directory components (basename).
-time <yyyy>-<mm>-<dd>T<hh>:<mm>:<ss>[.<sssssss>]
-\tOverride data file timestamp
+time "<yyyy>-<mm>-<dd> <hh>:<mm>:<ss>[.<sssssss>]"
+\tOverride data file timestamp (Full resolution: +5 bytes per volume)
 dryrun\tDisplay file names and sizes but do not create them
 rr\tProduce Rar 3 recovery records (~1% of total size)
 unicode\tStore data file name in Unicode (~4 bytes per volume)
 lf\tUse only LFs at end of text lines in SFV file
+crcrlf\tUse CR-CR-LF end-of-line sequence
+sfvhead\tSpecify SFV header
+naming3\tForce "new" Rar 3 volume naming scheme (".partN.rar"). Default is
+\t"old" Rar 2 unless names beyond ".r99" would be needed.
+naming2
+lock\tSet "lock" bit, indicating the archive is not supposed to be modified
+nonum\tDo not include volume number in end block
+blankend
+\tDo not include any fields in end block
+normalattr
+\tSet "normal" (instead of usual "archive") file attribute bit
+dict <size>
+\tSpecify dictionary size (default is 4096 for Rar 3 and 256 for Rar 2)
+rar2\t"Old" Rar version 2 format
+size <size>
+\tRar volume size (default is 15000000)
+unix\tSet OS to Unix (instead of Windows)
+lenient\tIgnore problems with the reference file
+overwrite
+\tAllow writing to release directory that already exists
 """)
 #~ time +/-s.sssssss\tAdjust data file timestamp
+#~ M specifies units of 10^6. (TODO: Use scene rules for default.)
         return
-    elif file is None:
-        raise SystemExit("""Data file not specified.
-Try "{} help".""".format(sys.argv[0]))
     
+    if ref is not None:
+        if timestamp is not None or is_rr or is_unicode or is_lock:
+            raise SystemExit("""\
+"Reference" mode not compatible with "timestamp", "rr", "unicode", and
+"lock" options.""")
+        
+        with Parser(ref) as parser:
+            rls_name = os.path.basename(os.path.dirname(ref))
+            if rls_name.startswith("."):
+                rls_name = None
+            else:
+                parser.out("rls", rls_name)
+            version = None
+            
+            hdr = parser.read(len(RAR_ID))
+            if RAR_ID != hdr:
+                parser.die(0, "Invalid Rar marker")
+            
+            (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_MAIN, "Main",
+                RAR_MAIN_FIRSTVOLUME ^ RAR_MAIN_RECOVERY ^ RAR_MAIN_LOCK ^
+                RAR_MAIN_NEWNUMBERING, RAR_MAIN_VOLUME)
+            is_rr = bool(flags & RAR_MAIN_RECOVERY)
+            is_lock = bool(flags & RAR_MAIN_LOCK)
+            is_first = bool(flags & RAR_MAIN_FIRSTVOLUME)
+            if is_rr:
+                parser.out("rr")
+            if is_lock:
+                parser.out("lock")
+            
+            naming_version = 3 if flags & RAR_MAIN_NEWNUMBERING else 2
+            parser.out("naming{}".format(naming_version))
+            
+            if MAIN_HDR_SIZE != len(hdr):
+                parser.error(pos + HDR_SIZE_POS,
+                    "Expected main block size 0x{:X}".format(MAIN_HDR_SIZE))
+            if any(x != 0 for x in hdr[S_BLK_HDR.size:]):
+                parser.error(pos + S_BLK_HDR.size,
+                    "Expected zeroed main block data")
+            
+            (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_FILE,  "File",
+                RAR_FILE_SPLIT_BEFORE ^ RAR_FILE_SPLIT_AFTER ^
+                RAR_FILE_UNICODE ^ RAR_FILE_EXTTIME ^ RAR_FILE_DICTMASK,
+                RAR_LONG_BLOCK)
+            is_unicode = bool(flags & RAR_FILE_UNICODE)
+            split_before = bool(flags & RAR_FILE_SPLIT_BEFORE)
+            split_after = bool(flags & RAR_FILE_SPLIT_AFTER)
+            dict = flags & RAR_FILE_DICTMASK
+            
+            dict_size = DICT_MIN << (dict >> DICT_POS)
+            if dict_size > DICT_MAX:
+                parser.error(pos + HDR_FLAGS_POS, "Unexpected dictionary "
+                    "size in flags: 0x{:02X}".format(dict))
+            
+            hdr_pos = S_BLK_HDR.size
+            
+            if is_unicode:
+                parser.out("unicode")
+            
+            (pack_size, data_size, host_os, file_crc, timestamp, rar_ver,
+                compress, name_size, attr) = (
+                S_FILE_HDR.unpack_from(hdr, hdr_pos))
+            
+            if RAR_OS_UNIX == host_os:
+                parser.out("unix")
+            elif RAR_OS_WIN32 != host_os:
+                parser.error(pos + hdr_pos + FILE_OS_POS,
+                    "Expected Windows OS")
+            
+            timestamp = [
+                1980 + (timestamp >> DOS_YEAR_BIT & bitmask(DOS_YEAR_BITS)),
+                1 + (timestamp >> DOS_MONTH_BIT & bitmask(DOS_MONTH_BITS)),
+                timestamp >> DOS_DAY_BIT & bitmask(DOS_DAY_BITS),
+                timestamp >> DOS_HOUR_BIT & bitmask(DOS_HOUR_BITS),
+                timestamp >> DOS_MIN_BIT & bitmask(DOS_MIN_BITS),
+                (timestamp >> DOS_2SEC_BIT & bitmask(DOS_2SEC_BITS)) << 1,
+            ]
+            timestamp_frac = 0
+            
+            if 20 != rar_ver:
+                parser.error(pos + hdr_pos + FILE_VER_POS,
+                    "Expected Rar version 2.0")
+            if ord("0") != compress:
+                parser.error(pos + hdr_pos + FILE_METHOD_POS,
+                    "Compression used")
+            if 1 << ATTR_NORMAL == attr:
+                parser.out("normalattr")
+            elif 1 << ATTR_ARCHIVE != attr:
+                parser.error(pos + hdr_pos + FILE_ATTR_POS,
+                    "Unexpected file attributes: 0x{:08X}".format(attr))
+            
+            hdr_pos += S_FILE_HDR.size
+            
+            if flags & RAR_FILE_LARGE:
+                parser.die(pos + HDR_FLAGS_POS, "Large file not supported")
+            
+            name_field = hdr[hdr_pos:][:name_size]
+            
+            if not flags & RAR_FILE_UNICODE:
+                intname = name_field.decode("latin-1")
+            else:
+                intname = name_field[:name_field.index(bytes((0,)))].decode(
+                    "latin-1")
+                if encode_filename(intname, True) != name_field:
+                    parser.error(pos + hdr_pos + len(intname) + 1,
+                        "Unexpected filename encoding")
+            parser.out("internal", intname)
+            hdr_pos += name_size
+            
+            if flags & RAR_FILE_SALT:
+                parser.die(pos + HDR_FLAGS_POS, "Salt not supported")
+            
+            if flags & RAR_FILE_EXTTIME:
+                (xtime_flags,) = S_SHORT.unpack_from(hdr, hdr_pos)
+                if (xtime_flags & ~((
+                    1 << TIME_ONE_BIT ^
+                    bitmask(TIME_SIZE_BITS) << TIME_SIZE_BIT
+                ) << MTIME_INDEX * TIME_FLAG_BITS) !=
+                1 << TIME_VALID_BIT << MTIME_INDEX * TIME_FLAG_BITS):
+                    parser.die(pos + hdr_pos, "Unsupported extended time")
+                
+                xtime_flags = (xtime_flags >> MTIME_INDEX * TIME_FLAG_BITS &
+                    bitmask(TIME_FLAG_BITS))
+                if not xtime_flags & (
+                    1 << TIME_ONE_BIT |
+                    bitmask(TIME_SIZE_BITS) << TIME_SIZE_BIT
+                ):
+                    parser.error(pos + hdr_pos, "Unneeded extended time")
+                
+                # Seconds field
+                timestamp[5] |= xtime_flags >> TIME_ONE_BIT & 1
+                
+                hdr_pos += 2
+                
+                size = xtime_flags >> TIME_SIZE_BIT & bitmask(TIME_SIZE_BITS)
+                for place in range(TIME_FRAC_BYTES - size, TIME_FRAC_BYTES):
+                    timestamp_frac |= hdr[hdr_pos] << BYTE_BITS * place
+                    hdr_pos += 1
+                timestamp_frac /= 10 ** TIME_FRAC_DIGITS
+            
+            timestamp = time.struct_time(tuple(timestamp) + (0, 0, 0))
+            parser.out("time", time.strftime("%Y-%m-%d %H:%M:%S", timestamp))
+            if timestamp_frac:
+                print(".{:0{digits}}".format(round(timestamp_frac * 10 **
+                    TIME_FRAC_DIGITS), digits=TIME_FRAC_DIGITS), end="")
+            
+            if hdr_pos != len(hdr):
+                parser.error(pos + hdr_pos, "Excess file block header "
+                    "length: {}".format(len(hdr) - hdr_pos))
+            
+            print("{}: Size: {}".format(intname, fmt_size(data_size)),
+                end="", file=sys.stderr)
+            sys.stderr.flush()
+            if not split_after:
+                left = pack_size
+                while left > 0:
+                    left -= len(parser.read(min(FILE_CRC_BUF, left)))
+                
+                print(" CRC: {:08X}".format(file_crc), end="",
+                    file=sys.stderr)
+            else:
+                calc_crc = file_crc32(parser, pack_size)
+                if file_crc != calc_crc:
+                    parser.error(pos + len(hdr),
+                        "CRC mismatch; calculated 0x{:08X}".format(calc_crc))
+            print(file=sys.stderr)
+            
+            if is_rr:
+                (pos, hdr, type, flags) = parser.read_block()
+                if RAR_BLOCK_OLD_RECOVERY == type:
+                    version = 2
+                    parser.expect_flags(pos, "Rar 2 RR", flags, 0,
+                        RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN)
+                    hdr_pos = S_BLK_HDR.size
+                    
+                    (data_size,) = S_LONG.unpack_from(hdr, hdr_pos)
+                    hdr_pos += S_LONG.size
+                    
+                    if 20 != hdr[hdr_pos]:
+                        parser.error(pos + hdr_pos,
+                            "Expected Rar version 2.0")
+                    hdr_pos += 1
+                    
+                    (rr_count,) = S_SHORT.unpack_from(hdr, hdr_pos)
+                    hdr_pos += S_SHORT.size
+                    
+                    (prot_sect_count,) = S_LONG.unpack_from(hdr, hdr_pos)
+                    hdr_pos += S_LONG.size
+                    
+                    if RR_PROTECT_2 != hdr[hdr_pos:][:len(RR_PROTECT_2)]:
+                        parser.error(pos + hdr_pos,
+                            'Expected "{}"'.format(RR_PROTECT_2))
+                    hdr_pos += len(RR_PROTECT_2)
+                    
+                    parser.expect_rr(pos, data_size, rr_count,
+                        prot_sect_count, hdr, hdr_pos)
+                elif RAR_BLOCK_SUB == type:
+                    version = 3
+                    parser.expect_flags(pos, "Sub", flags, 0,
+                        RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN)
+                    hdr_pos = S_BLK_HDR.size
+                    
+                    (pack_size, data_size, sub_os, file_crc, sub_time,
+                        rar_ver, compress, name_size, sub_attr) = (
+                        S_FILE_HDR.unpack_from(hdr, hdr_pos))
+                    
+                    if 0 != sub_time or 0 != sub_attr:
+                        parser.error(pos + hdr_pos, "Expected zero sub-"
+                            "block timestamp and file attributes")
+                    if 29 != rar_ver:
+                        parser.error(pos + hdr_pos + FILE_VER_POS,
+                            "Expected Rar version 2.9")
+                    if host_os != sub_os:
+                        parser.error(pos + hdr_pos + FILE_OS_POS,
+                            "Sub-block ({}) and file ({}) OSes do not match".
+                            format(sub_os, host_os))
+                    if ord("0") != compress:
+                        parser.die(pos + hdr_pos + FILE_METHOD_POS,
+                            "Compression used")
+                    if pack_size != data_size:
+                        parser.error(pos + hdr_pos + FILE_PACK_POS, "Sub-"
+                            "block packed size does not match unpacked size")
+                    
+                    hdr_pos += S_FILE_HDR.size
+                    if RR_SUB_NAME != hdr[hdr_pos:][:name_size]:
+                        parser.die(pos + hdr_pos, "Expected RR sub-block")
+                    hdr_pos += name_size
+                    
+                    if RR_PROTECT_3 != hdr[hdr_pos:][:len(RR_PROTECT_3)]:
+                        parser.error(pos + hdr_pos,
+                            'Expected "{}"'.format(RR_PROTECT_3))
+                    hdr_pos += len(RR_PROTECT_3)
+                    
+                    (rr_count,) = S_LONG.unpack_from(hdr, hdr_pos)
+                    hdr_pos += S_LONG.size
+                    
+                    (prot_sect_count,) = struct.unpack_from("<Q", hdr,
+                        hdr_pos)
+                    hdr_pos += 8
+                    
+                    rr_block_crc = parser.expect_rr(pos, data_size, rr_count,
+                        prot_sect_count, hdr, hdr_pos)
+                    
+                    if file_crc != rr_block_crc:
+                        parser.error(parser.file.tell(),
+                            "RR block CRC mismatch; calculated 0x{:08X}".
+                            format(rr_block_crc))
+                else:
+                    parser.die(pos, "Expected RR block")
+            
+            vol_crc = parser.vol_crc
+            (pos, hdr, type, flags) = parser.read_block()
+            this_version = 3 if hdr else 2
+            if version is not None and this_version != version:
+                parser.error(pos, "Unexpected end block presence for Rar {}".
+                    format(version))
+            else:
+                version = this_version
+            
+            if hdr:
+                parser.expect_type(pos, type, RAR_BLOCK_ENDARC, "End")
+                parser.expect_flags(pos, "End", flags,
+                    RAR_ENDARC_NEXT_VOLUME ^ RAR_ENDARC_DATACRC ^
+                    RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR,
+                    RAR_SKIP_IF_UNKNOWN)
+                next_volume = bool(flags & RAR_ENDARC_NEXT_VOLUME)
+                
+                if next_volume != split_after:
+                    parser.error(pos + HDR_FLAGS_POS, "Split after ({}) and "
+                        "next volume ({}) flags to not match".format
+                        (split_after, next_volume))
+                
+                end_flags = flags & (RAR_ENDARC_DATACRC ^
+                    RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR)
+                if RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE == end_flags:
+                    parser.out("nonum")
+                elif 0 == end_flags:
+                    parser.out("blankend")
+                elif (RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE ^
+                RAR_ENDARC_VOLNR != end_flags):
+                    parser.error(pos + HDR_FLAGS_POS,
+                        "Unexpected end block flag combination 0x{:01X}".
+                        format(end_flags))
+                
+                hdr_pos = S_BLK_HDR.size
+                
+                if end_flags & RAR_ENDARC_DATACRC:
+                    if S_LONG.unpack_from(hdr, hdr_pos) != (vol_crc,):
+                        parser.error(pos + hdr_pos, "Volume CRC mismatch; "
+                            "calculated 0x{:08X}".format(vol_crc))
+                    hdr_pos += S_LONG.size
+                
+                if end_flags & RAR_ENDARC_VOLNR:
+                    (volnum,) = S_SHORT.unpack_from(hdr, hdr_pos)
+                    if (0 == volnum) != is_first:
+                        parser.error(pos + hdr_pos, "Volume number ({}) and "
+                            "first volume flag ({}) do not match".
+                            format(volnum, is_first))
+                    #~ if volnum != Numbering(new_numbering).name(ref):
+                        
+                    hdr_pos += S_SHORT.size
+                
+                if end_flags & RAR_ENDARC_REVSPACE:
+                    if any(x != 0 for x in hdr[hdr_pos:][:END_EXTRA]):
+                        parser.error(pos + S_BLK_HDR.size,
+                            "Expected zeroed end block data")
+                    hdr_pos += END_EXTRA
+                if hdr_pos != len(hdr):
+                    parser.error(pos + HDR_SIZE_POS,
+                        "Unexpected extra end block data")
+                
+                pos = parser.file.tell()
+                if parser.read(1):
+                    parser.error(pos, "Expected end of file")
+            
+            if 3 != version:
+                parser.out("rar{}".format(version))
+            if version >= 3 and split_before != (not is_first):
+                parser.error(None, "Split before ({}) and first volume ({}) "
+                    "flags do not correspond".format(split_before, is_first))
+            elif version < 3 and is_first:
+                parser.error(None,
+                    "First volume flag set but not Rar 3 format")
+            if DICT_DEFAULT[version] != dict:
+                parser.out("dict", dict_size)
+            
+            print("Reference volume size:", fmt_size(pos), file=sys.stderr)
+        
+        if not os.path.basename(ref).startswith(
+        os.path.splitext(intname)[0]):
+            print("{}: appears to have been renamed".format(ref),
+                file=sys.stderr)
+            parser.fail = True
+        
+        # Verify size against rr_count
+        # TODO: if not the final volume and RR doesn't introduce ambiguities,
+        # show volume size. Verify against specified volume size?
+        
+        #~ with "sfv" as sfv:
+            #~ get header
+            #~ find ref name
+            
+        
+        print()
+        
+        if parser.fail and not lenient:
+            raise SystemExit()
+        if is_dryrun:
+            return
+    
+    if dict is None:
+        dict = DICT_DEFAULT[version]
+    
+    if file is None:
+        file = ""
+    if not file or os.path.isdir(file):
+        if intname is None:
+            raise SystemExit("""Data file not specified.
+Try "{} help".""".format(sys.argv[0]))
+        file = os.path.join(file, intname)
     if intname is None:
         intname = os.path.basename(file)
     name_field = filename_encode(intname, is_unicode)
@@ -123,14 +574,15 @@ Try "{} help".""".format(sys.argv[0]))
     (dostime, xtime_field) = time_encode(timestamp, timestamp_frac)
     file_size = file_stat.st_size
     
-    data_max = vol_max - END_SIZE # Volume up to potential RR
+    # Volume up to potential RR
+    data_max = vol_max - end_size(version, end_flags)
     
     if is_rr:
-        rr_max = calc_rr_count(vol_max)
-        data_max = calc_prot_size(data_max, rr_max)
+        rr_max = calc_rr_count(version, vol_max, vol_max)
+        data_max = calc_prot_size(version, data_max, rr_max)
     
-    data_max -= len(RAR_ID) + MAIN_HDR_SIZE + \
-        file_hdr_size(name_field, xtime_field)
+    data_max -= (len(RAR_ID) + MAIN_HDR_SIZE +
+        file_hdr_size(name_field, xtime_field))
     
     vol_count = quanta(file_size, data_max)
     base = os.path.splitext(intname)[0]
@@ -138,127 +590,194 @@ Try "{} help".""".format(sys.argv[0]))
     sfv_name = "{}.sfv".format(base)
     rls_size = 0
     
-    new_numbering = vol_count > 1 + 100
+    if naming_version is None:
+        naming_version = 3 if vol_count > 1 + 100 else 2
+    if naming_version >= 3:
+        volnum = Numbering3(vol_digits)
+    else:
+        volnum = Numbering2()
     print("Number of volumes:", vol_count, file=sys.stderr)
     
-    if not is_dryrun:
-        volume = None
-        sfv_file = None
-        data = open(file, "rb")
-        file_crc = 0
-    try:
-        sfv = set() if is_dryrun else dict()
-        
-        volnum = 0
+    if rls_name is None:
+        rls_name = ""
+    else:
+        if not (overwrite and os.path.isdir(rls_name)):
+            os.mkdir(rls_name)
+    
+    Writer = DryRlsWriter if is_dryrun else RlsWriter
+    with Writer(file, version, host_os, is_rr, naming_version, newline) as (
+    rls):
         start_ellipsis = True
         left = file_size
         while left > 0:
-            is_first_vol = not volnum
+            volname = "{}.{}".format(base, next(volnum))
+            
+            is_first_vol = volnum.is_first()
             is_last_vol = left <= data_max
             data_size = left if is_last_vol else data_max
-            
-            if new_numbering:
-                volname = "{}.part{:0{digits}}.rar".format(base, 1 + volnum,
-                    digits=vol_digits)
-            elif is_first_vol:
-                volname = "{}.rar".format(base)
-            elif volnum - 1 < 100:
-                volname = "{}.r{:02}".format(base, volnum - 1)
-            else:
-                volname = "{}.s{:02}".format(base, volnum - 1 - 100)
-            
-            is_interesting = not is_dryrun or is_first_vol or \
-                volnum >= vol_count - 2 or not new_numbering and \
-                    volnum - 1 <= 200 and (volnum - 1) % 100 in {0, 99}
+            is_interesting = (not is_dryrun or volnum.is_interesting() or
+                volnum.num >= vol_count - 2)
             
             if is_interesting:
                 print(volname, end=": ", file=sys.stderr)
                 sys.stderr.flush()
             elif start_ellipsis:
-                print(". . .")
+                print(". . .", file=sys.stderr)
             
-            if not is_dryrun:
-                volume = open(volname, "w+b")
-            vol_size = 0
+            with rls.new_vol(os.path.join(rls_name, volname)) as vol:
+                vol.write_id()
+                vol.write_main(is_first_vol, is_lock)
+                vol.write_file(not is_first_vol, not is_last_vol, name_field,
+                    is_unicode, dict, attr, dostime, xtime_field, file_size,
+                    data_size)
+                
+                if is_rr:
+                    if is_last_vol or version < 3:
+                        rr_count = calc_rr_count(version, vol.size, vol_max)
+                    else:
+                        rr_count = rr_max
+                    vol.write_rr(rr_count)
+                
+                vol.write_end(end_flags, volnum.num, is_last_vol)
             
-            if not is_dryrun: volume.write(RAR_ID)
-            vol_size += len(RAR_ID)
+            rls.sfv_add(vol, volname)
+            rls_size += vol.size
             
-            if not is_dryrun: write_main(volume, is_rr, is_first_vol)
-            vol_size += MAIN_HDR_SIZE
-            
-            if not is_dryrun: file_crc = write_file(volume, data,
-                not is_first_vol, not is_last_vol, name_field, is_unicode,
-                file_crc, dostime, xtime_field, file_size, data_size)
-            vol_size += file_hdr_size(name_field, xtime_field) + data_size
-            
-            if is_rr:
-                if is_last_vol: rr_count = calc_rr_count(vol_size)
-                else: rr_count = rr_max
-                if not is_dryrun: write_rr(volume, rr_count)
-                vol_size += SUB_RR_HEADER_SIZE + \
-                        quanta(vol_size, RR_SECT_SIZE) * RR_CRC_SIZE + \
-                        rr_count * RR_SECT_SIZE
-            
-            if not is_dryrun:
-                crc = write_end(volume, volnum, is_last_vol)
-            vol_size += END_SIZE
-            
-            if not is_dryrun:
-                volume.seek(-END_SIZE, io.SEEK_CUR)
-                crc = crc32(volume.read(END_SIZE), crc)
-                volume.close()
-                volume = None
-            
-            if is_dryrun: sfv.add(volname)
-            else: sfv[volname] = crc
-            rls_size += vol_size
-            
-            if is_dryrun:
-                if is_interesting: print("Size: {}".
-                    format(fmt_size(vol_size)), file=sys.stderr)
-            else:
-                print("Size: {} CRC: {:08X}".format(fmt_size(vol_size), crc),
-                    file=sys.stderr)
+            if is_interesting:
+                sys.stderr.write("Size: {}".format(fmt_size(vol.size)))
+                if not is_dryrun:
+                    sys.stderr.write(" CRC: {:08X}".format(vol.crc))
+                print(file=sys.stderr)
             
             left -= data_size
-            volnum += 1
             start_ellipsis = is_interesting
         
-        if not is_dryrun:
-            sfv_file = open(sfv_name, "wt", encoding="latin-1",
-                newline=newline)
-        sfv_size = 0
-        
-        for name in sorted(sfv):
-            if not is_dryrun:
-                sfv_file.write("{} {:08x}\n".format(name, sfv[name]))
-            sfv_size += len(name) + 1 + 8 + len(newline)
-        
-        if not is_dryrun:
-            sfv_file.close()
-            sfv_file = None
-        print("{}: Size: {}".format(sfv_name, fmt_size(sfv_size)),
+        rls.sfv_write(os.path.join(rls_name, sfv_name), sfvhead)
+        print("{}: Size: {}".format(sfv_name, fmt_size(rls.sfv_size)),
             file=sys.stderr)
-        rls_size += sfv_size
-        
-    finally:
-        if not is_dryrun:
-            if volume is not None: volume.close()
-            if sfv_file is not None: sfv_file.close()
-            data.close()
+        rls_size += rls.sfv_size
     
     print("Total release size: {}".format(fmt_size(rls_size)))
 
 def get_timestamp(s):
     frac = re.search(r"(\.\d*)?$", s)
-    tm = time.strptime(s[:frac.start()], "%Y-%m-%dT%H:%M:%S")
+    tm = time.strptime(s[:frac.start()], "%Y-%m-%d %H:%M:%S")
     frac = frac.group()
-    if frac not in {"", "."}:
-        frac = float(frac)
-    else:
+    if frac in {"", "."}:
         frac = 0
+    else:
+        frac = float(frac)
     return (tm, frac)
+
+class Parser:
+    def __init__(self, file):
+        self.fail = False
+        self.vol_crc = 0
+        self.file = open(file, "rb")
+    
+    def __enter__(self):
+        self.file = self.file.__enter__()
+        return self
+    
+    def __exit__(self, *exc):
+        self.file.__exit__()
+    
+    def msg(self, pos, msg):
+        return "{}+0x{:X}: {}".format(self.file.name, pos, msg)
+    
+    def error(self, pos, msg):
+        print(self.msg(pos, msg), file=sys.stderr)
+        self.fail = True
+    
+    def die(self, pos, msg):
+        raise SystemExit(self.msg(pos, msg))
+    
+    def expect_rr(self, pos, data_size, rr_count, prot_sect_count, hdr,
+    hdr_used):
+        expect = quanta(pos, RR_SECT_SIZE)
+        if expect != prot_sect_count:
+            self.die(pos, "Expected protected sector count: {} not {}".
+                format(expect, prot_sect_count))
+        
+        hdr = len(hdr)
+        if hdr_used != hdr:
+            self.error(pos + hdr_used,
+                "Excess RR header length: {}".format(hdr - hdr_used))
+        
+        if (data_size !=
+        prot_sect_count * RR_CRC_SIZE + rr_count * RR_SECT_SIZE):
+            self.die(pos + S_BLOCK_HDR.size, "RR block data size does not "
+                "correspond with sector and RR counts")
+        
+        (rr_crcs, rr_sects) = rr_calc(self.file, rr_count, pos)
+        self.file.seek(+hdr, io.SEEK_CUR)
+        crc = RR_CRC_INIT
+        
+        for i in range(prot_sect_count):
+            pos = self.file.tell();
+            calc_crc = rr_crcs[i * RR_CRC_SIZE:][:RR_CRC_SIZE]
+            read_crc = self.read(RR_CRC_SIZE)
+            if read_crc != calc_crc:
+                self.error(pos, "Sector {} CRC mismatch; calculated "
+                    "0x{:04X}".format(i, S_SHORT.unpack(calc_crc)))
+            
+            crc = crc32(read_crc, crc)
+        
+        for (i, sect) in enumerate(rr_sects):
+            pos = self.file.tell()
+            calc_sect = bytes(sect.buffer())
+            read_sect = self.read(len(calc_sect))
+            if read_sect != calc_sect:
+                parser.error(pos, "Recovery sector {}/{} mismatch".
+                    format(i, rr_count))
+            
+            crc = crc32(read_sect, crc)
+        
+        return crc
+    
+    def expect_block(self, exp_type, name, ign_flags, exp_flags):
+        (pos, hdr, type, flags) = self.read_block()
+        self.expect_type(pos, type, exp_type, name)
+        self.expect_flags(pos, name, flags, ign_flags, exp_flags)
+        return (pos, hdr, flags)
+    
+    def read_block(self):
+        pos = self.file.tell()
+        
+        hdr = self.read(S_BLK_HDR.size)
+        if not hdr:
+            return (pos, None, None, None)
+        
+        (crc, type, flags, size) = S_BLK_HDR.unpack(hdr)
+        
+        if size < S_BLK_HDR.size:
+            self.die(pos + HDR_SIZE_POS,
+                "Block size too small: {}".format(size))
+        hdr += self.read(size - S_BLK_HDR.size)
+        
+        calc_crc = crc32(hdr[HDR_DATA_POS:]) & bitmask(16)
+        if calc_crc != crc:
+            self.die(pos + HDR_CRC_POS,
+                "Expected block CRC 0x{:04X}".format(calc_crc))
+        return (pos, hdr, type, flags)
+    
+    def expect_type(self, pos, type, expect, name):
+        if expect != type:
+            self.die(pos + HDR_TYPE_POS,
+                "Expected block type 0x{:02X} ({})".format(expect, name))
+        
+    def expect_flags(self, pos, block, flags, ignore, expect):
+        if flags & ~ignore != expect:
+            self.error(pos + HDR_FLAGS_POS, "Unexpected flags: 0x{:04X} "
+                "(Block: {})".format(flags, block))
+    
+    def read(self, size):
+        data = self.file.read(size)
+        self.vol_crc = crc32(data, self.vol_crc)
+        return data
+    
+    def out(self, *args):
+        print("", *args, end="")
 
 def fmt_size(size):
     s = str(size)
@@ -275,14 +794,181 @@ def fmt_size(size):
     
     return s
 
+class DryRlsWriter:
+    def __init__(self, name, version, host_os, is_rr, naming, newline):
+        self.version = version
+        self.sfv_size = 0
+        self.sfv_newline = newline
+    
+    def __enter__(self):
+        return self
+    def __exit__(self, *exc):
+        pass
+    
+    def new_vol(self, name):
+        return DryVolWriter(self)
+    
+    def sfv_add(self, vol, name):
+        self.sfv_size += len(name) + 1 + 8 + len(self.sfv_newline)
+    
+    def sfv_write(self, name, head):
+        self.sfv_size += (len(head) +
+            head.count("\n") * (len(self.sfv_newline) - 1))
+
+class RlsWriter(DryRlsWriter):
+    def __init__(self, file, version, host_os, is_rr, naming, newline):
+        DryRlsWriter.__init__(self, file, version, host_os, is_rr, naming,
+            newline)
+        
+        self.data = open(file, "rb")
+        self.os = host_os
+        self.naming = naming
+        self.is_rr = is_rr
+        self.file_crc = 0
+        self.sfv_entries = dict()
+        self.sfv_size = 0
+    
+    def __enter__(self):
+        self.data = self.data.__enter__()
+        return self
+    
+    def __exit__(self, *exc):
+        self.data.__exit__()
+    
+    def new_vol(self, name):
+        return VolWriter(self, name)
+    
+    def sfv_add(self, vol, name):
+        self.sfv_entries[name] = vol.crc
+        DryRlsWriter.sfv_add(self, vol, name)
+    
+    def sfv_write(self, name, head):
+        with open(name, "wt", encoding="latin-1", newline="") as sfv:
+            sfv.write(head.replace("\n", self.sfv_newline))
+            for entry in sorted(self.sfv_entries):
+                sfv.write("{} {:08x}{}".format(entry,
+                    self.sfv_entries[entry], self.sfv_newline))
+
+class DryVolWriter:
+    def __init__(self, rls):
+        self.rls = rls
+        self.size = 0
+    
+    def __enter__(self): return self
+    def __exit__(self, *exc): pass
+    
+    def write_id(self):
+        self.size += len(RAR_ID)
+    
+    def write_main(self, is_first, is_lock):
+        self.size += MAIN_HDR_SIZE
+        
+    def write_file(self, split_before, split_after, name, is_unicode, dict,
+    attr, dostime, xtime, file_size, data_size):
+        self.size += file_hdr_size(name, xtime) + data_size
+    
+    def write_rr(self, count):
+        self.size += (RR_HEADER_SIZE[self.rls.version] +
+            quanta(self.size, RR_SECT_SIZE) * RR_CRC_SIZE +
+            count * RR_SECT_SIZE)
+    
+    def write_end(self, flags, volnum, is_last):
+        self.size += end_size(self.rls.version, flags)
+
+class VolWriter(DryVolWriter):
+    def __init__(self, rls, name):
+        self.file = open(name, "w+b")
+        DryVolWriter.__init__(self, rls)
+    
+    def __enter__(self):
+        self.file = self.file.__enter__()
+        return self
+    
+    def __exit__(self, *exc):
+        self.file.__exit__(*exc)
+    
+    def write_id(self):
+        self.file.write(RAR_ID)
+        DryVolWriter.write_id(self)
+    
+    def write_main(self, is_first, is_lock):
+        write_main(self.file, self.rls.version, self.rls.is_rr, is_first,
+            self.rls.naming, is_lock)
+        DryVolWriter.write_main(self, is_first, is_lock)
+    
+    def write_file(self, split_before, split_after, name, is_unicode, dict,
+    attr, dostime, xtime, file_size, data_size):
+        self.rls.file_crc = write_file(self.file, self.rls.data,
+            split_before, split_after, name, is_unicode, dict, self.rls.os,
+            attr, self.rls.file_crc, dostime, xtime, file_size, data_size)
+        DryVolWriter.write_file(self, split_before, split_after, name,
+            is_unicode, dict, attr, dostime, xtime, file_size, data_size)
+    
+    def write_rr(self, count):
+        write_rr(self.rls.version, self.rls.os, self.file, count)
+        DryVolWriter.write_rr(self, count)
+    
+    def write_end(self, flags, volnum, is_last):
+        size = self.file.tell()
+        self.crc = write_end(self.file, self.rls.version, flags, volnum,
+            is_last)
+        DryVolWriter.write_end(self, flags, volnum, is_last)
+        size = self.file.tell() - size
+        
+        self.file.seek(-size, io.SEEK_CUR)
+        self.crc = crc32(self.file.read(size), self.crc)
+
+class VolNumbering:
+    def __init__(self):
+        self.next = 0
+    
+    def __iter__(self): return self
+    
+    def __next__(self):
+        self.num = self.next
+        self.next = self.next + 1
+        return self.num
+    
+    def is_first(self):
+        return not self.num
+    
+    def is_interesting(self):
+        return self.is_first()
+
+class Numbering3(VolNumbering):
+    def __init__(self, digits):
+        VolNumbering.__init__(self)
+        self.digits = digits
+    
+    def __next__(self):
+        return "part{:0{digits}}.rar".format(1 + VolNumbering.__next__(self),
+            digits=self.digits)
+
+class Numbering2(VolNumbering):
+    def __next__(self):
+        num = VolNumbering.__next__(self)
+        if num < 1:
+            return "rar"
+        num -= 1
+        if num < 100:
+            return "r{:02}".format(num)
+        num -= 100
+        return "s{:02}".format(num)
+    
+    def is_interesting(self):
+        return (VolNumbering.is_interesting(self) or
+            self.num - 1 <= 200 and (self.num - 1) % 100 in {0, 99})
+
 # Extra stuff appropriate for "rarfile" module
 
-def write_main(volume, is_rr, is_first_vol):
+def write_main(volume, version, is_rr, is_first_vol, naming, is_lock):
     write_block(volume,
         type=RAR_BLOCK_MAIN,
         flags=RAR_MAIN_VOLUME ^
             is_rr * RAR_MAIN_RECOVERY ^
-            is_first_vol * RAR_MAIN_FIRSTVOLUME,
+            (version >= 3 and is_first_vol) * RAR_MAIN_FIRSTVOLUME ^
+            is_lock * RAR_MAIN_LOCK ^
+            (naming >= 3) * RAR_MAIN_NEWNUMBERING,
         data=(
             (0 for i in range(RAR_MAIN_EXTRA)),
         ))
@@ -291,7 +977,8 @@ RAR_MAIN_EXTRA = 2 + 4
 MAIN_HDR_SIZE = S_BLK_HDR.size + RAR_MAIN_EXTRA
 
 def write_file(volume, file, split_before, split_after, name, is_unicode,
-accum_crc, dostime, xtime=None, size=None, pack_size=None):
+dict, host_os, attr, accum_crc, dostime, xtime=None, size=None,
+pack_size=None):
     header_size = file_hdr_size(name, xtime)
     volume.seek(+header_size, io.SEEK_CUR)
     
@@ -302,15 +989,15 @@ accum_crc, dostime, xtime=None, size=None, pack_size=None):
         left -= len(chunk)
         volume.write(chunk)
         crc = crc32(chunk, crc)
-        if split_after: accum_crc = crc32(chunk, accum_crc)
+        if split_after:
+            accum_crc = crc32(chunk, accum_crc)
     
-    flags = RAR_LONG_BLOCK ^ split_before * RAR_FILE_SPLIT_BEFORE ^ \
-        split_after * RAR_FILE_SPLIT_AFTER ^ \
-        RAR_FILE_DICT4096 ^ \
-        is_unicode * RAR_FILE_UNICODE
+    flags = (RAR_LONG_BLOCK ^ split_before * RAR_FILE_SPLIT_BEFORE ^
+        split_after * RAR_FILE_SPLIT_AFTER ^ dict ^
+        is_unicode * RAR_FILE_UNICODE)
     parts = [
-        S_FILE_HDR.pack(pack_size, size, RAR_OS_WIN32, crc, dostime, 20,
-            ord("0"), len(name), 1 << 5),
+        S_FILE_HDR.pack(pack_size, size, host_os, crc, dostime, 20, ord("0"),
+            len(name), attr),
         name,
     ]
     if xtime is not None:
@@ -328,129 +1015,20 @@ def file_hdr_size(name, xtime):
     if xtime is not None: size += len(xtime)
     return size
 
-def write_rr(volume, rr_count):
-    prot_size = volume.tell()
-    rr_crcs = bytearray()
-    
-    # Fast access to RR sectors as machine words instead of bytes.
-    # The xor operation is endian-agnostic.
-    # On an x86-64 computer,
-    #     element-wise array.array("L") xor operation was about 8 times
-    #         faster than for bytearray
-    #     array-wise numpy.array(dtype=int) xor operation was about 3.5 times
-    #         faster than for element-wise array.array("L")
-    if USE_NUMPY: blank = lambda: numpy.frombuffer(bytearray(RR_SECT_SIZE),
-        dtype=numpy.int)
-    elif USE_ARRAY: blank = lambda: array.array("L", bytes(RR_SECT_SIZE))
-    else: blank = lambda: bytearray(RR_SECT_SIZE)
-    rr_sects = tuple(blank() for i in range(rr_count))
-    
-    volume.seek(0)
-    left = prot_size
-    slice = 0
-    while left > 0:
-        if left < RR_SECT_SIZE:
-            chunk = volume.read(left). \
-                ljust(RR_SECT_SIZE, bytes((0,)))
-            left = 0
-        else:
-            chunk = volume.read(RR_SECT_SIZE)
-            left -= RR_SECT_SIZE
-        
-        rr_crcs.extend(S_SHORT.pack(~crc32(chunk) & bitmask(16)))
-        
-        s = rr_sects[slice]
-        if USE_NUMPY:
-            s ^= numpy.frombuffer(chunk, dtype=numpy.int)
-        elif USE_ARRAY:
-            for (i, v) in enumerate(array.array("L", chunk)):
-                s[i] ^= v
-        else:
-            for i in range(len(s)):
-                s[i] ^= chunk[i]
-        
-        slice = (slice + 1) % rr_count
-    
-    # Why is this odd CRC initialiser used?
-    crc = crc32(rr_crcs, 0xF0000000)
-    for s in rr_sects: crc = crc32(s, crc)
-    
-    prot_sect_count = quanta(prot_size, RR_SECT_SIZE)
-    size = prot_sect_count * RR_CRC_SIZE + rr_count * RR_SECT_SIZE
-    
-    write_block(volume,
-        type=RAR_BLOCK_SUB,
-        flags=RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN,
-        data=(
-            S_FILE_HDR.pack(size, size, RAR_OS_WIN32, crc, 0, 29, ord("0"),
-                len(SUB_RR_NAME), 0),
-            SUB_RR_NAME,
-            SUB_RR_PROTECT,
-            S_LONG.pack(rr_count),
-            struct.pack("<Q", prot_sect_count),
-        ))
-    volume.write(rr_crcs)
-    for s in rr_sects: volume.write(s)
+FILE_PACK_POS = 0
+FILE_DATA_POS = 4
+FILE_OS_POS = 8
+FILE_CRC_POS = 9
+FILE_TIME_POS = 13
+FILE_VER_POS = 17
+FILE_METHOD_POS = 18
+FILE_NAME_POS = 19
+FILE_ATTR_POS = 21
 
-def calc_rr_count(total):
-    if total < RR_SECT_SIZE:
-        return 1
-    
-    # Default recovery data size is 0.6%
-    rr = total * 6 // RR_SECT_SIZE // 1000 + 2
-    
-    if rr >= RR_MAX: return RR_MAX
-    
-    if rr < 6: return rr
-    else: return rr | 1 # Always an odd number
-
-# Calculate space available for RR-protected data
-def calc_prot_size(volsize, rr_count):
-    # Allocate space for all RR-protected data and sector CRCs
-    space = volsize - SUB_RR_HEADER_SIZE - rr_count * RR_SECT_SIZE
-    
-    # Last quantum is useless if it cannot fit a CRC and any data
-    last_q = last_quantum(space, RR_QUANTUM)
-    if last_q <= RR_CRC_SIZE: space -= last_q
-    
-    prot_sect_count = quanta(space, RR_QUANTUM)
-    return space - prot_sect_count * RR_CRC_SIZE
-
-RR_MAX = 524288
-RR_SECT_SIZE = 512
-RR_CRC_SIZE = 2
-SUB_RR_NAME = b"RR"
-SUB_RR_PROTECT = b"Protect+"
-SUB_RR_HEADER_SIZE = S_BLK_HDR.size + S_FILE_HDR.size + len(SUB_RR_NAME) + \
-    len(SUB_RR_PROTECT) + 4 + 8
-
-# One quantum of space for each CRC
-RR_QUANTUM = RR_SECT_SIZE + RR_CRC_SIZE
-
-def write_end(volume, volnum, is_last_vol):
-    left = volume.tell()
-    volume.seek(0)
-    crc = 0
-    while left > 0:
-        chunk = volume.read(min(FILE_CRC_BUF, left))
-        left -= len(chunk)
-        crc = crc32(chunk, crc)
-    
-    write_block(volume,
-        type=RAR_BLOCK_ENDARC,
-        flags=RAR_SKIP_IF_UNKNOWN ^
-            (not is_last_vol) * RAR_ENDARC_NEXT_VOLUME ^ RAR_ENDARC_DATACRC ^
-            RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR,
-        data=(
-            S_LONG.pack(crc),
-            S_SHORT.pack(volnum),
-            (0 for i in range(END_EXTRA)),
-        ))
-    
-    return crc
-
-END_EXTRA = 7
-END_SIZE = S_BLK_HDR.size + 4 + 2 + END_EXTRA
+DICT_DEFAULT = {2: RAR_FILE_DICT256, 3: RAR_FILE_DICT4096}
+DICT_MIN = 64
+DICT_MAX = 4096
+DICT_POS = 5
 
 def filename_encode(name, is_unicode):
     field = bytearray(name, "latin-1")
@@ -498,42 +1076,243 @@ COPY_LEN_BITS = 7
 COPY_MSB_BIT = 7
 
 def time_encode(tm, frac=0):
-    dostime = \
-        tm.tm_sec >> 1 << 0 ^ \
-        tm.tm_min << 5 ^ \
-        tm.tm_hour << 11 ^ \
-        tm.tm_mday << 16 ^ \
-        (tm.tm_mon - 1) << 21 ^ \
-        tm.tm_year - 1980 << 25
+    dostime = (
+        tm.tm_sec >> 1 << DOS_2SEC_BIT ^
+        tm.tm_min << DOS_MIN_BIT ^
+        tm.tm_hour << DOS_HOUR_BIT ^
+        tm.tm_mday << DOS_DAY_BIT ^
+        (tm.tm_mon - 1) << DOS_MONTH_BIT ^
+        tm.tm_year - 1980 << DOS_YEAR_BIT)
     
     one_sec = tm.tm_sec & 1
     if not frac and not one_sec: return (dostime, None)
     
     flags = 1 << TIME_VALID_BIT
     flags |= one_sec << TIME_ONE_BIT
-    frac = int(frac * 10 ** 7)
+    frac = int(frac * 10 ** TIME_FRAC_DIGITS)
     
-    precision = TIME_FRAC_BYTES
-    while precision > 0:
+    size = TIME_FRAC_BYTES
+    while size > 0:
         if frac & 0xFF: break
         frac >>= 8
-        --precision
-    flags |= precision
+        size -= 1
+    flags |= size << TIME_SIZE_BIT
     
     xtime = bytearray(S_SHORT.pack(
         flags << MTIME_INDEX * TIME_FLAG_BITS))
     
-    for i in range(precision):
+    for i in range(size):
         xtime.append(frac & 0xFF)
         frac >>= 8
     
     return (dostime, xtime)
 
+DOS_2SEC_BIT = 0
+DOS_2SEC_BITS = 5
+DOS_MIN_BIT = 5
+DOS_MIN_BITS = 6
+DOS_HOUR_BIT = 11
+DOS_HOUR_BITS = 5
+DOS_DAY_BIT = 16
+DOS_DAY_BITS = 5
+DOS_MONTH_BIT = 21
+DOS_MONTH_BITS = 4
+DOS_YEAR_BIT = 25
+DOS_YEAR_BITS = 7
+
 MTIME_INDEX = 3
 TIME_FLAG_BITS = 4
 TIME_VALID_BIT = 3
 TIME_ONE_BIT = 2
+TIME_SIZE_BIT = 0
+TIME_SIZE_BITS = 2
+TIME_FRAC_DIGITS = 7
 TIME_FRAC_BYTES = 3
+
+ATTR_ARCHIVE = 5
+ATTR_NORMAL = 7
+
+def write_rr(version, host_os, volume, rr_count):
+    prot_size = volume.tell()
+    (rr_crcs, rr_sects) = rr_calc(volume, rr_count, prot_size)
+    
+    crc = crc32(rr_crcs, RR_CRC_INIT)
+    for s in rr_sects:
+        crc = crc32(s.buffer(), crc)
+    
+    prot_sect_count = len(rr_crcs) // S_SHORT.size
+    size = prot_sect_count * RR_CRC_SIZE + rr_count * RR_SECT_SIZE
+    
+    if version < 3:
+        write_block(volume,
+            type=RAR_BLOCK_OLD_RECOVERY,
+            flags=RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN,
+            data=(
+                S_LONG.pack(size),
+                (20,),
+                S_SHORT.pack(rr_count),
+                S_LONG.pack(prot_sect_count),
+                RR_PROTECT_2,
+            ))
+    else:
+        write_block(volume,
+            type=RAR_BLOCK_SUB,
+            flags=RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN,
+            data=(
+                S_FILE_HDR.pack(size, size, host_os, crc, 0, 29, ord("0"),
+                    len(RR_SUB_NAME), 0),
+                RR_SUB_NAME,
+                RR_PROTECT_3,
+                S_LONG.pack(rr_count),
+                struct.pack("<Q", prot_sect_count),
+            ))
+    
+    volume.write(rr_crcs)
+    for s in rr_sects:
+        volume.write(s.buffer())
+
+def rr_calc(volume, rr_count, size):
+    volume.seek(0)
+    
+    rr_crcs = bytearray()
+    rr_sects = tuple(BitVector(RR_SECT_SIZE) for i in range(rr_count))
+    
+    slice = 0
+    while size > 0:
+        if size < RR_SECT_SIZE:
+            chunk = volume.read(size).ljust(RR_SECT_SIZE, bytes((0,)))
+            size = 0
+        else:
+            chunk = volume.read(RR_SECT_SIZE)
+            size -= RR_SECT_SIZE
+        
+        rr_crcs.extend(S_SHORT.pack(~crc32(chunk) & bitmask(16)))
+        rr_sects[slice].xor(chunk)
+        slice = (slice + 1) % rr_count
+    
+    return (rr_crcs, rr_sects)
+
+def calc_rr_count(version, total, vol_max):
+    if version < 3:
+        if vol_max < 50000:
+            rr = 2
+        if 50000 <= vol_max < 500000:
+            rr = 4
+        if 500000 <= vol_max:
+            rr = 8
+        
+        return min(rr, quanta(total, RR_SECT_SIZE))
+    
+    if version >= 3:
+        if total < RR_SECT_SIZE:
+            return 1
+        
+        # Default recovery data size is 0.6%
+        rr = total * 6 // RR_SECT_SIZE // 1000 + 2
+        
+        if rr >= RR_MAX:
+            return RR_MAX
+        
+        if rr < 6:
+            return rr
+        else:
+            return rr | 1 # Always an odd number
+
+# Calculate space available for RR-protected data
+def calc_prot_size(version, volsize, rr_count):
+    # Allocate space for all RR-protected data and sector CRCs
+    space = volsize - RR_HEADER_SIZE[version] - rr_count * RR_SECT_SIZE
+    
+    # Last quantum is useless if it cannot fit a CRC and any data
+    last_q = last_quantum(space, RR_QUANTUM)
+    if last_q <= RR_CRC_SIZE: space -= last_q
+    
+    prot_sect_count = quanta(space, RR_QUANTUM)
+    return space - prot_sect_count * RR_CRC_SIZE
+
+RR_MAX = 524288
+RR_SECT_SIZE = 512
+RR_CRC_SIZE = 2
+RR_SUB_NAME = b"RR"
+RR_PROTECT_2 = b"Protect!"
+RR_PROTECT_3 = b"Protect+"
+RR_HEADER_SIZE = {
+    2: S_BLK_HDR.size + 4 + 1 + 2 + 4 + len(RR_PROTECT_2),
+    3: S_BLK_HDR.size + S_FILE_HDR.size + len(RR_SUB_NAME) +
+        len(RR_PROTECT_3) + 4 + 8,
+}
+
+# Why is this odd CRC initialiser used?
+RR_CRC_INIT = 0xF0000000
+
+# One quantum of space for each CRC
+RR_QUANTUM = RR_SECT_SIZE + RR_CRC_SIZE
+
+# Fast access to RR sectors as machine words instead of bytes.
+# The xor operation is endian-agnostic.
+# On an x86-64 computer,
+#     element-wise array.array("L") xor operation was about 8 times faster
+#         than bytearray
+#     array-wise numpy.array(dtype=int) xor operation was about 3.5 times
+#         faster than for element-wise array.array("L")
+if USE_NUMPY:
+    class BitVector:
+        def __init__(self, size):
+            self.array = numpy.frombuffer(bytearray(size),
+                dtype=numpy.int)
+        def buffer(self):
+            return self.array
+        def xor(self, buffer):
+            return self.array.__ixor__(
+                numpy.frombuffer(buffer, dtype=numpy.int))
+else:
+    class BitVector:
+        def __init__(self, size):
+            self.array = array.array("L", bytes(size))
+        def buffer(self):
+            return self.array
+        def xor(self, buffer):
+            for (i, v) in enumerate(array.array("L", buffer)):
+                self.array[i] ^= v
+            return self
+
+def write_end(volume, version, flags, volnum, is_last_vol):
+    size = volume.tell()
+    volume.seek(0)
+    crc = file_crc32(volume, size)
+    
+    if version >= 3:
+        flags |= (RAR_SKIP_IF_UNKNOWN ^
+            (not is_last_vol) * RAR_ENDARC_NEXT_VOLUME)
+        parts = list()
+        
+        if flags & RAR_ENDARC_DATACRC:
+            parts.append(S_LONG.pack(crc))
+        if flags & RAR_ENDARC_VOLNR:
+            parts.append(S_SHORT.pack(volnum))
+        if flags & RAR_ENDARC_REVSPACE:
+            parts.append(0 for i in range(END_EXTRA))
+        
+        write_block(volume, RAR_BLOCK_ENDARC, flags, parts)
+    
+    return crc
+
+def end_size(version, flags):
+    if version < 3:
+        return 0
+    
+    size = S_BLK_HDR.size
+    
+    if flags & RAR_ENDARC_DATACRC:
+        size += 4
+    if flags & RAR_ENDARC_VOLNR:
+        size += 2
+    if flags & RAR_ENDARC_REVSPACE:
+        size += END_EXTRA
+    
+    return size
+
+END_EXTRA = 7
 
 # The "rar_decompress" function creates a Rar file but not in a reusable way
 def write_block(file, type, flags, data):
@@ -549,7 +1328,20 @@ def write_block(file, type, flags, data):
     file.write(header)
     file.write(block)
 
+HDR_CRC_POS = 0
+HDR_DATA_POS = 2
+HDR_TYPE_POS = 2
+HDR_FLAGS_POS = 3
+HDR_SIZE_POS = 5
 S_BLK_HDR_DATA = Struct("<BHH") # S_BLK_HDR without the CRC field prepended
+
+def file_crc32(file, size):
+    crc = 0
+    while size > 0:
+        chunk = file.read(min(FILE_CRC_BUF, size))
+        size -= len(chunk)
+        crc = crc32(chunk, crc)
+    return crc
 
 def bitmask(size): return ~(~0 << size)
 BYTE_BITS = 8
