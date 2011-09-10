@@ -40,26 +40,29 @@ def main():
     # size 15M => Rar volume size. M specifies units of 10^6. Default is 15M. (TODO: Use scene rules for default.)
     # srr => Produce rescene file rather than Rar files
     # srr-rr-full => Do not strip Rar recovery records (older SRR file format). Requires srr and one of the rr options.
-    # rr => Produce Rar 3 recovery records
     # rr-old => Produce older Rar recovery records
     # internal name-grp.avi => Name to be used for the data file inside the Rar set. Defaults to the external file name, without any directory components.
     # volume => Explicitly specify first, second, etc full volume name. Default is ".partN.rar" for "new" Rar 3 naming scheme, where the number of digits is automatically determined by the total number of volumes; and ".rar", ".r00", ".r01", etc, ".r99", ".s00", etc, ".s99" or ".001", ".002", etc, for the "old" naming scheme.
-    # base => Base output name, appended with ".sfv", ".partN" and/or ".rar" as appropriate. Default is the base name of the data file with extension removed.
+    # base => Base output name, appended with ".sfv", ".partN" and/or ".rar" as appropriate. Default is the base name of the data file internal name with extension removed.
     # naming-new => Force "new" Rar 3 volume naming scheme
     # naming-old => Force "old" volume naming scheme
     # Default: Automatically choose "old" or "new" Rar 3 volume naming scheme depending on the number of volumes needed. More than 101 invokes the "new" Rar 3 scheme.
-    # unicode file names? (utf8, "unicode", none, auto none if not necessary)
     # Option to only do the first volume, the first few volumes, or any given set of volumes?
     
     help = False
+    file = None
+    intname = None
     vol_max = 15 * 10 ** 6
     timestamp = None
     is_dryrun = False
+    is_rr = False
+    is_unicode = False
+    newline = "\r\n"
     
     i = 1
     while i < len(sys.argv):
         arg = sys.argv[i]
-        if arg in ("help", "-h", "--help", "-?", "?"):
+        if arg in {"help", "-h", "--help", "-?", "?"}:
             help = True
             i += 1
         elif "file" == arg:
@@ -71,22 +74,46 @@ def main():
         elif "dryrun" == arg:
             is_dryrun = True
             i += 1
-        else: raise Exception("""Bad command line argument: "{}".
+        elif "rr" == arg:
+            is_rr = True
+            i += 1
+        elif "unicode" == arg:
+            is_unicode = True
+            i += 1
+        elif "lf" == arg:
+            newline = "\n"
+            i += 1
+        elif "internal" == arg:
+            intname = sys.argv[i + 1]
+            i += 2
+        else: raise SystemExit("""Bad command line argument: "{}".
 Try "{} help".""".format(arg, sys.argv[0]))
     
     if help:
         print("""\
 Options:
 help\tDisplay this help
-file <name-grp.avi>\tSpecify data file
-time <yyyy>-<mm>-<dd>T<hh>:<mm>:<ss>[.<sssssss>]\tOverride data file
-\ttimestamp\
+file <grp-name.avi>
+\tSpecify data file (Mandatory)
+internal <grp-name.avi>
+\tName to be used for the data file inside the Rar set. Defaults to the
+\texternal file name, without any directory components (basename).
+time <yyyy>-<mm>-<dd>T<hh>:<mm>:<ss>[.<sssssss>]
+\tOverride data file timestamp
 dryrun\tDisplay file names and sizes but do not create them
+rr\tProduce Rar 3 recovery records (~1% of total size)
+unicode\tStore data file name in Unicode (~4 bytes per volume)
+lf\tUse only LFs at end of text lines in SFV file
 """)
 #~ time +/-s.sssssss\tAdjust data file timestamp
         return
+    elif file is None:
+        raise SystemExit("""Data file not specified.
+Try "{} help".""".format(sys.argv[0]))
     
-    name_field = filename_encode(file)
+    if intname is None:
+        intname = os.path.basename(file)
+    name_field = filename_encode(intname, is_unicode)
     
     file_stat = os.stat(file)
     if timestamp is None:
@@ -95,17 +122,23 @@ dryrun\tDisplay file names and sizes but do not create them
     
     (dostime, xtime_field) = time_encode(timestamp, timestamp_frac)
     file_size = file_stat.st_size
-    rr_max = calc_rr_count(vol_max)
     
-    data_max = calc_prot_size(vol_max, rr_max)
+    data_max = vol_max - END_SIZE # Volume up to potential RR
+    
+    if is_rr:
+        rr_max = calc_rr_count(vol_max)
+        data_max = calc_prot_size(data_max, rr_max)
+    
     data_max -= len(RAR_ID) + MAIN_HDR_SIZE + \
         file_hdr_size(name_field, xtime_field)
     
     vol_count = quanta(file_size, data_max)
-    base = os.path.splitext(os.path.basename(file))[0]
+    base = os.path.splitext(intname)[0]
     vol_digits = 1 + int(math.log10(vol_count - 1))
     sfv_name = "{}.sfv".format(base)
+    rls_size = 0
     
+    new_numbering = vol_count > 1 + 100
     print("Number of volumes:", vol_count, file=sys.stderr)
     
     if not is_dryrun:
@@ -117,13 +150,13 @@ dryrun\tDisplay file names and sizes but do not create them
         sfv = set() if is_dryrun else dict()
         
         volnum = 0
+        start_ellipsis = True
         left = file_size
         while left > 0:
             is_first_vol = not volnum
             is_last_vol = left <= data_max
             data_size = left if is_last_vol else data_max
             
-            new_numbering = False
             if new_numbering:
                 volname = "{}.part{:0{digits}}.rar".format(base, 1 + volnum,
                     digits=vol_digits)
@@ -134,8 +167,15 @@ dryrun\tDisplay file names and sizes but do not create them
             else:
                 volname = "{}.s{:02}".format(base, volnum - 1 - 100)
             
-            print(volname, end=": ", file=sys.stderr)
-            sys.stderr.flush()
+            is_interesting = not is_dryrun or is_first_vol or \
+                volnum >= vol_count - 2 or not new_numbering and \
+                    volnum - 1 <= 200 and (volnum - 1) % 100 in {0, 99}
+            
+            if is_interesting:
+                print(volname, end=": ", file=sys.stderr)
+                sys.stderr.flush()
+            elif start_ellipsis:
+                print(". . .")
             
             if not is_dryrun:
                 volume = open(volname, "w+b")
@@ -144,20 +184,21 @@ dryrun\tDisplay file names and sizes but do not create them
             if not is_dryrun: volume.write(RAR_ID)
             vol_size += len(RAR_ID)
             
-            if not is_dryrun: write_main(volume, is_first_vol)
+            if not is_dryrun: write_main(volume, is_rr, is_first_vol)
             vol_size += MAIN_HDR_SIZE
             
             if not is_dryrun: file_crc = write_file(volume, data,
-                not is_first_vol, not is_last_vol, name_field, file_crc,
-                dostime, xtime_field, file_size, data_size)
+                not is_first_vol, not is_last_vol, name_field, is_unicode,
+                file_crc, dostime, xtime_field, file_size, data_size)
             vol_size += file_hdr_size(name_field, xtime_field) + data_size
             
-            rr_count = rr_max
-            if is_last_vol: rr_count = calc_rr_count(vol_size)
-            if not is_dryrun: write_rr(volume, rr_count)
-            vol_size += SUB_RR_HEADER_SIZE + \
-                    quanta(vol_size, RR_SECT_SIZE) * RR_CRC_SIZE + \
-                    rr_count * RR_SECT_SIZE
+            if is_rr:
+                if is_last_vol: rr_count = calc_rr_count(vol_size)
+                else: rr_count = rr_max
+                if not is_dryrun: write_rr(volume, rr_count)
+                vol_size += SUB_RR_HEADER_SIZE + \
+                        quanta(vol_size, RR_SECT_SIZE) * RR_CRC_SIZE + \
+                        rr_count * RR_SECT_SIZE
             
             if not is_dryrun:
                 crc = write_end(volume, volnum, is_last_vol)
@@ -169,53 +210,78 @@ dryrun\tDisplay file names and sizes but do not create them
                 volume.close()
                 volume = None
             
+            if is_dryrun: sfv.add(volname)
+            else: sfv[volname] = crc
+            rls_size += vol_size
+            
             if is_dryrun:
-                sfv.add(volname)
-                print("Size: {}".format(vol_size), file=sys.stderr)
+                if is_interesting: print("Size: {}".
+                    format(fmt_size(vol_size)), file=sys.stderr)
             else:
-                sfv[volname] = crc
-                print("Size: {} CRC: {:08X}".format(vol_size, crc),
+                print("Size: {} CRC: {:08X}".format(fmt_size(vol_size), crc),
                     file=sys.stderr)
             
             left -= data_size
             volnum += 1
+            start_ellipsis = is_interesting
         
         if not is_dryrun:
-            sfv_file = open(sfv_name, "wt", encoding="latin-1", newline="")
+            sfv_file = open(sfv_name, "wt", encoding="latin-1",
+                newline=newline)
         sfv_size = 0
         
         for name in sorted(sfv):
             if not is_dryrun:
-                sfv_file.write("{} {:08x}\r\n".format(name, sfv[name]))
-            sfv_size += len(name) + 1 + 8 + 2
+                sfv_file.write("{} {:08x}\n".format(name, sfv[name]))
+            sfv_size += len(name) + 1 + 8 + len(newline)
         
         if not is_dryrun:
             sfv_file.close()
             sfv_file = None
-        print("{}: Size: {}".format(sfv_name, sfv_size), file=sys.stderr)
+        print("{}: Size: {}".format(sfv_name, fmt_size(sfv_size)),
+            file=sys.stderr)
+        rls_size += sfv_size
         
     finally:
         if not is_dryrun:
             if volume is not None: volume.close()
             if sfv_file is not None: sfv_file.close()
             data.close()
+    
+    print("Total release size: {}".format(fmt_size(rls_size)))
 
 def get_timestamp(s):
     frac = re.search(r"(\.\d*)?$", s)
     tm = time.strptime(s[:frac.start()], "%Y-%m-%dT%H:%M:%S")
     frac = frac.group()
-    if frac not in ("", "."):
+    if frac not in {"", "."}:
         frac = float(frac)
     else:
         frac = 0
     return (tm, frac)
 
+def fmt_size(size):
+    s = str(size)
+    
+    if size >= 1024:
+        if size < 1024 << 10:
+            pref = "K"
+        else:
+            for pref in "MGTPEZY":
+                size >>= 10
+                if size < 1024 << 10: break
+        
+        s += " ({:.3f} {}iB)".format(size / 1024, pref)
+    
+    return s
+
 # Extra stuff appropriate for "rarfile" module
 
-def write_main(volume, is_first_vol):
+def write_main(volume, is_rr, is_first_vol):
     write_block(volume,
         type=RAR_BLOCK_MAIN,
-        flags=RAR_MAIN_VOLUME ^ RAR_MAIN_RECOVERY ^ \
+        flags=RAR_MAIN_VOLUME ^
+            is_rr * RAR_MAIN_RECOVERY ^
             is_first_vol * RAR_MAIN_FIRSTVOLUME,
         data=(
             (0 for i in range(RAR_MAIN_EXTRA)),
@@ -224,8 +290,8 @@ def write_main(volume, is_first_vol):
 RAR_MAIN_EXTRA = 2 + 4
 MAIN_HDR_SIZE = S_BLK_HDR.size + RAR_MAIN_EXTRA
 
-def write_file(volume, file, split_before, split_after, name, accum_crc,
-dostime, xtime=None, size=None, pack_size=None):
+def write_file(volume, file, split_before, split_after, name, is_unicode,
+accum_crc, dostime, xtime=None, size=None, pack_size=None):
     header_size = file_hdr_size(name, xtime)
     volume.seek(+header_size, io.SEEK_CUR)
     
@@ -239,8 +305,9 @@ dostime, xtime=None, size=None, pack_size=None):
         if split_after: accum_crc = crc32(chunk, accum_crc)
     
     flags = RAR_LONG_BLOCK ^ split_before * RAR_FILE_SPLIT_BEFORE ^ \
-        split_after * RAR_FILE_SPLIT_AFTER ^ RAR_FILE_DICT4096 ^ \
-        RAR_FILE_UNICODE
+        split_after * RAR_FILE_SPLIT_AFTER ^ \
+        RAR_FILE_DICT4096 ^ \
+        is_unicode * RAR_FILE_UNICODE
     parts = [
         S_FILE_HDR.pack(pack_size, size, RAR_OS_WIN32, crc, dostime, 20,
             ord("0"), len(name), 1 << 5),
@@ -340,7 +407,7 @@ def calc_rr_count(total):
 # Calculate space available for RR-protected data
 def calc_prot_size(volsize, rr_count):
     # Allocate space for all RR-protected data and sector CRCs
-    space = volsize - SUB_RR_HEADER_SIZE - rr_count * RR_SECT_SIZE - END_SIZE
+    space = volsize - SUB_RR_HEADER_SIZE - rr_count * RR_SECT_SIZE
     
     # Last quantum is useless if it cannot fit a CRC and any data
     last_q = last_quantum(space, RR_QUANTUM)
@@ -385,8 +452,10 @@ def write_end(volume, volnum, is_last_vol):
 END_EXTRA = 7
 END_SIZE = S_BLK_HDR.size + 4 + 2 + END_EXTRA
 
-def filename_encode(name):
+def filename_encode(name, is_unicode):
     field = bytearray(name, "latin-1")
+    if not is_unicode: return field
+    
     field.append(0)
     field.append(1) # Default MSB observed in the wild
     pos = 0
@@ -434,7 +503,7 @@ def time_encode(tm, frac=0):
         tm.tm_min << 5 ^ \
         tm.tm_hour << 11 ^ \
         tm.tm_mday << 16 ^ \
-        tm.tm_mon << 21 ^ \
+        (tm.tm_mon - 1) << 21 ^ \
         tm.tm_year - 1980 << 25
     
     one_sec = tm.tm_sec & 1
