@@ -211,7 +211,7 @@ overwrite
         
         with Parser(ref) as parser:
             rls_name = os.path.basename(os.path.dirname(ref))
-            if rls_name.startswith("."):
+            if not rls_name or rls_name.startswith("."):
                 rls_name = None
             else:
                 parser.out("rls", rls_name)
