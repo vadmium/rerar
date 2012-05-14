@@ -273,7 +273,7 @@ overwrite
             
             timestamp = [
                 1980 + (timestamp >> DOS_YEAR_BIT & bitmask(DOS_YEAR_BITS)),
-                1 + (timestamp >> DOS_MONTH_BIT & bitmask(DOS_MONTH_BITS)),
+                timestamp >> DOS_MONTH_BIT & bitmask(DOS_MONTH_BITS),
                 timestamp >> DOS_DAY_BIT & bitmask(DOS_DAY_BITS),
                 timestamp >> DOS_HOUR_BIT & bitmask(DOS_HOUR_BITS),
                 timestamp >> DOS_MIN_BIT & bitmask(DOS_MIN_BITS),
@@ -1081,7 +1081,7 @@ def time_encode(tm, frac=0):
         tm.tm_min << DOS_MIN_BIT ^
         tm.tm_hour << DOS_HOUR_BIT ^
         tm.tm_mday << DOS_DAY_BIT ^
-        (tm.tm_mon - 1) << DOS_MONTH_BIT ^
+        tm.tm_mon << DOS_MONTH_BIT ^
         tm.tm_year - 1980 << DOS_YEAR_BIT)
     
     one_sec = tm.tm_sec & 1
