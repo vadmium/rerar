@@ -212,345 +212,19 @@ overwrite
 "Reference" mode not compatible with "timestamp", "rr", "unicode", and
 "lock" options.""")
         
-        with Parser(ref) as parser:
-            rls_name = os.path.basename(os.path.dirname(ref))
-            if not rls_name or rls_name.startswith("."):
-                rls_name = None
-            else:
-                parser.out("rls", rls_name)
-            version = None
-            
-            hdr = parser.read(len(RAR_ID))
-            if RAR_ID != hdr:
-                parser.die(0, "Invalid Rar marker")
-            
-            (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_MAIN, "Main",
-                RAR_MAIN_FIRSTVOLUME ^ RAR_MAIN_RECOVERY ^ RAR_MAIN_LOCK ^
-                RAR_MAIN_NEWNUMBERING, RAR_MAIN_VOLUME)
-            is_rr = bool(flags & RAR_MAIN_RECOVERY)
-            is_lock = bool(flags & RAR_MAIN_LOCK)
-            is_first = bool(flags & RAR_MAIN_FIRSTVOLUME)
-            if is_rr:
-                parser.out("rr")
-            if is_lock:
-                parser.out("lock")
-            
-            naming_version = 3 if flags & RAR_MAIN_NEWNUMBERING else 2
-            parser.out("naming{}".format(naming_version))
-            
-            if MAIN_HDR_SIZE != len(hdr):
-                parser.error(pos + HDR_SIZE_POS,
-                    "Expected main block size 0x{:X}".format(MAIN_HDR_SIZE))
-            if any(x != 0 for x in hdr[S_BLK_HDR.size:]):
-                parser.error(pos + S_BLK_HDR.size,
-                    "Expected zeroed main block data")
-            
-            (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_FILE,  "File",
-                RAR_FILE_SPLIT_BEFORE ^ RAR_FILE_SPLIT_AFTER ^
-                RAR_FILE_UNICODE ^ RAR_FILE_EXTTIME ^ RAR_FILE_DICTMASK,
-                RAR_LONG_BLOCK)
-            is_unicode = bool(flags & RAR_FILE_UNICODE)
-            split_before = bool(flags & RAR_FILE_SPLIT_BEFORE)
-            split_after = bool(flags & RAR_FILE_SPLIT_AFTER)
-            dict = flags & RAR_FILE_DICTMASK
-            
-            dict_size = DICT_MIN << (dict >> DICT_POS)
-            if dict_size > DICT_MAX:
-                parser.error(pos + HDR_FLAGS_POS, "Unexpected dictionary "
-                    "size in flags: 0x{:02X}".format(dict))
-            
-            hdr_pos = S_BLK_HDR.size
-            
-            if is_unicode:
-                parser.out("unicode")
-            
-            (pack_size, data_size, host_os, file_crc, timestamp, rar_ver,
-                compress, name_size, attr) = (
-                S_FILE_HDR.unpack_from(hdr, hdr_pos))
-            
-            if RAR_OS_UNIX == host_os:
-                parser.out("unix")
-            elif RAR_OS_WIN32 != host_os:
-                parser.error(pos + hdr_pos + FILE_OS_POS,
-                    "Expected Windows OS")
-            
-            timestamp = [
-                1980 + (timestamp >> DOS_YEAR_BIT & bitmask(DOS_YEAR_BITS)),
-                timestamp >> DOS_MONTH_BIT & bitmask(DOS_MONTH_BITS),
-                timestamp >> DOS_DAY_BIT & bitmask(DOS_DAY_BITS),
-                timestamp >> DOS_HOUR_BIT & bitmask(DOS_HOUR_BITS),
-                timestamp >> DOS_MIN_BIT & bitmask(DOS_MIN_BITS),
-                (timestamp >> DOS_2SEC_BIT & bitmask(DOS_2SEC_BITS)) << 1,
-            ]
-            timestamp_frac = 0
-            
-            if 20 != rar_ver:
-                parser.error(pos + hdr_pos + FILE_VER_POS,
-                    "Expected Rar version 2.0")
-            if ord("0") != compress:
-                parser.error(pos + hdr_pos + FILE_METHOD_POS,
-                    "Compression used")
-            if 1 << ATTR_NORMAL == attr:
-                parser.out("normalattr")
-            elif 1 << ATTR_ARCHIVE != attr:
-                parser.error(pos + hdr_pos + FILE_ATTR_POS,
-                    "Unexpected file attributes: 0x{:08X}".format(attr))
-            
-            hdr_pos += S_FILE_HDR.size
-            
-            if flags & RAR_FILE_LARGE:
-                parser.die(pos + HDR_FLAGS_POS, "Large file not supported")
-            
-            name_field = hdr[hdr_pos:][:name_size]
-            
-            if not flags & RAR_FILE_UNICODE:
-                intname = name_field.decode("latin-1")
-            else:
-                intname = name_field[:name_field.index(bytes((0,)))].decode(
-                    "latin-1")
-                if encode_filename(intname, True) != name_field:
-                    parser.error(pos + hdr_pos + len(intname) + 1,
-                        "Unexpected filename encoding")
-            parser.out("internal", intname)
-            hdr_pos += name_size
-            
-            if flags & RAR_FILE_SALT:
-                parser.die(pos + HDR_FLAGS_POS, "Salt not supported")
-            
-            if flags & RAR_FILE_EXTTIME:
-                (xtime_flags,) = S_SHORT.unpack_from(hdr, hdr_pos)
-                if (xtime_flags & ~((
-                    1 << TIME_ONE_BIT ^
-                    bitmask(TIME_SIZE_BITS) << TIME_SIZE_BIT
-                ) << MTIME_INDEX * TIME_FLAG_BITS) !=
-                1 << TIME_VALID_BIT << MTIME_INDEX * TIME_FLAG_BITS):
-                    parser.die(pos + hdr_pos, "Unsupported extended time")
-                
-                xtime_flags = (xtime_flags >> MTIME_INDEX * TIME_FLAG_BITS &
-                    bitmask(TIME_FLAG_BITS))
-                if not xtime_flags & (
-                    1 << TIME_ONE_BIT |
-                    bitmask(TIME_SIZE_BITS) << TIME_SIZE_BIT
-                ):
-                    parser.error(pos + hdr_pos, "Unneeded extended time")
-                
-                # Seconds field
-                timestamp[5] |= xtime_flags >> TIME_ONE_BIT & 1
-                
-                hdr_pos += 2
-                
-                size = xtime_flags >> TIME_SIZE_BIT & bitmask(TIME_SIZE_BITS)
-                for place in range(TIME_FRAC_BYTES - size, TIME_FRAC_BYTES):
-                    timestamp_frac |= hdr[hdr_pos] << BYTE_BITS * place
-                    hdr_pos += 1
-                timestamp_frac /= 10 ** TIME_FRAC_DIGITS
-            
-            timestamp = time.struct_time(tuple(timestamp) + (0, 0, 0))
-            parser.out("time", time.strftime("%Y-%m-%d %H:%M:%S", timestamp))
-            if timestamp_frac:
-                print(".{:0{digits}}".format(round(timestamp_frac * 10 **
-                    TIME_FRAC_DIGITS), digits=TIME_FRAC_DIGITS), end="")
-            
-            if hdr_pos != len(hdr):
-                parser.error(pos + hdr_pos, "Excess file block header "
-                    "length: {}".format(len(hdr) - hdr_pos))
-            
-            print("{}: Size: {}".format(intname, fmt_size(data_size)),
-                end="", file=sys.stderr)
-            sys.stderr.flush()
-            if not split_after:
-                left = pack_size
-                while left > 0:
-                    left -= len(parser.read(min(FILE_CRC_BUF, left)))
-                
-                print(" CRC: {:08X}".format(file_crc), end="",
-                    file=sys.stderr)
-            else:
-                calc_crc = file_crc32(parser, pack_size)
-                if file_crc != calc_crc:
-                    parser.error(pos + len(hdr),
-                        "CRC mismatch; calculated 0x{:08X}".format(calc_crc))
-            print(file=sys.stderr)
-            
-            if is_rr:
-                (pos, hdr, type, flags) = parser.read_block()
-                if RAR_BLOCK_OLD_RECOVERY == type:
-                    version = 2
-                    parser.expect_flags(pos, "Rar 2 RR", flags, 0,
-                        RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN)
-                    hdr_pos = S_BLK_HDR.size
-                    
-                    (data_size,) = S_LONG.unpack_from(hdr, hdr_pos)
-                    hdr_pos += S_LONG.size
-                    
-                    if 20 != hdr[hdr_pos]:
-                        parser.error(pos + hdr_pos,
-                            "Expected Rar version 2.0")
-                    hdr_pos += 1
-                    
-                    (rr_count,) = S_SHORT.unpack_from(hdr, hdr_pos)
-                    hdr_pos += S_SHORT.size
-                    
-                    (prot_sect_count,) = S_LONG.unpack_from(hdr, hdr_pos)
-                    hdr_pos += S_LONG.size
-                    
-                    if RR_PROTECT_2 != hdr[hdr_pos:][:len(RR_PROTECT_2)]:
-                        parser.error(pos + hdr_pos,
-                            'Expected "{}"'.format(RR_PROTECT_2))
-                    hdr_pos += len(RR_PROTECT_2)
-                    
-                    parser.expect_rr(pos, data_size, rr_count,
-                        prot_sect_count, hdr, hdr_pos)
-                elif RAR_BLOCK_SUB == type:
-                    version = 3
-                    parser.expect_flags(pos, "Sub", flags, 0,
-                        RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN)
-                    hdr_pos = S_BLK_HDR.size
-                    
-                    (pack_size, data_size, sub_os, file_crc, sub_time,
-                        rar_ver, compress, name_size, sub_attr) = (
-                        S_FILE_HDR.unpack_from(hdr, hdr_pos))
-                    
-                    if 0 != sub_time or 0 != sub_attr:
-                        parser.error(pos + hdr_pos, "Expected zero sub-"
-                            "block timestamp and file attributes")
-                    if 29 != rar_ver:
-                        parser.error(pos + hdr_pos + FILE_VER_POS,
-                            "Expected Rar version 2.9")
-                    if host_os != sub_os:
-                        parser.error(pos + hdr_pos + FILE_OS_POS,
-                            "Sub-block ({}) and file ({}) OSes do not match".
-                            format(sub_os, host_os))
-                    if ord("0") != compress:
-                        parser.die(pos + hdr_pos + FILE_METHOD_POS,
-                            "Compression used")
-                    if pack_size != data_size:
-                        parser.error(pos + hdr_pos + FILE_PACK_POS, "Sub-"
-                            "block packed size does not match unpacked size")
-                    
-                    hdr_pos += S_FILE_HDR.size
-                    if RR_SUB_NAME != hdr[hdr_pos:][:name_size]:
-                        parser.die(pos + hdr_pos, "Expected RR sub-block")
-                    hdr_pos += name_size
-                    
-                    if RR_PROTECT_3 != hdr[hdr_pos:][:len(RR_PROTECT_3)]:
-                        parser.error(pos + hdr_pos,
-                            'Expected "{}"'.format(RR_PROTECT_3))
-                    hdr_pos += len(RR_PROTECT_3)
-                    
-                    (rr_count,) = S_LONG.unpack_from(hdr, hdr_pos)
-                    hdr_pos += S_LONG.size
-                    
-                    (prot_sect_count,) = struct.unpack_from("<Q", hdr,
-                        hdr_pos)
-                    hdr_pos += 8
-                    
-                    rr_block_crc = parser.expect_rr(pos, data_size, rr_count,
-                        prot_sect_count, hdr, hdr_pos)
-                    
-                    if file_crc != rr_block_crc:
-                        parser.error(parser.file.tell(),
-                            "RR block CRC mismatch; calculated 0x{:08X}".
-                            format(rr_block_crc))
-                else:
-                    parser.die(pos, "Expected RR block")
-            
-            vol_crc = parser.vol_crc
-            (pos, hdr, type, flags) = parser.read_block()
-            this_version = 3 if hdr else 2
-            if version is not None and this_version != version:
-                parser.error(pos, "Unexpected end block presence for Rar {}".
-                    format(version))
-            else:
-                version = this_version
-            
-            if hdr:
-                parser.expect_type(pos, type, RAR_BLOCK_ENDARC, "End")
-                parser.expect_flags(pos, "End", flags,
-                    RAR_ENDARC_NEXT_VOLUME ^ RAR_ENDARC_DATACRC ^
-                    RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR,
-                    RAR_SKIP_IF_UNKNOWN)
-                next_volume = bool(flags & RAR_ENDARC_NEXT_VOLUME)
-                
-                if next_volume != split_after:
-                    parser.error(pos + HDR_FLAGS_POS, "Split after ({}) and "
-                        "next volume ({}) flags to not match".format
-                        (split_after, next_volume))
-                
-                end_flags = flags & (RAR_ENDARC_DATACRC ^
-                    RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR)
-                if RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE == end_flags:
-                    parser.out("nonum")
-                elif 0 == end_flags:
-                    parser.out("blankend")
-                elif (RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE ^
-                RAR_ENDARC_VOLNR != end_flags):
-                    parser.error(pos + HDR_FLAGS_POS,
-                        "Unexpected end block flag combination 0x{:01X}".
-                        format(end_flags))
-                
-                hdr_pos = S_BLK_HDR.size
-                
-                if end_flags & RAR_ENDARC_DATACRC:
-                    if S_LONG.unpack_from(hdr, hdr_pos) != (vol_crc,):
-                        parser.error(pos + hdr_pos, "Volume CRC mismatch; "
-                            "calculated 0x{:08X}".format(vol_crc))
-                    hdr_pos += S_LONG.size
-                
-                if end_flags & RAR_ENDARC_VOLNR:
-                    (volnum,) = S_SHORT.unpack_from(hdr, hdr_pos)
-                    if (0 == volnum) != is_first:
-                        parser.error(pos + hdr_pos, "Volume number ({}) and "
-                            "first volume flag ({}) do not match".
-                            format(volnum, is_first))
-                    #~ if volnum != Numbering(new_numbering).name(ref):
-                        
-                    hdr_pos += S_SHORT.size
-                
-                if end_flags & RAR_ENDARC_REVSPACE:
-                    if any(x != 0 for x in hdr[hdr_pos:][:END_EXTRA]):
-                        parser.error(pos + S_BLK_HDR.size,
-                            "Expected zeroed end block data")
-                    hdr_pos += END_EXTRA
-                if hdr_pos != len(hdr):
-                    parser.error(pos + HDR_SIZE_POS,
-                        "Unexpected extra end block data")
-                
-                pos = parser.file.tell()
-                if parser.read(1):
-                    parser.error(pos, "Expected end of file")
-            
-            if 3 != version:
-                parser.out("rar{}".format(version))
-            if version >= 3 and split_before != (not is_first):
-                parser.error(None, "Split before ({}) and first volume ({}) "
-                    "flags do not correspond".format(split_before, is_first))
-            elif version < 3 and is_first:
-                parser.error(None,
-                    "First volume flag set but not Rar 3 format")
-            if DICT_DEFAULT[version] != dict:
-                parser.out("dict", dict_size)
-            
-            print("Reference volume size:", fmt_size(pos), file=sys.stderr)
-        
-        if not os.path.basename(ref).startswith(
-        os.path.splitext(intname)[0]):
-            print("{}: appears to have been renamed".format(ref),
-                file=sys.stderr)
-            parser.fail = True
-        
-        # Verify size against rr_count
-        # TODO: if not the final volume and RR doesn't introduce ambiguities,
-        # show volume size. Verify against specified volume size?
+        (
+            rls_name, version, is_rr, is_lock, naming_version, is_unicode,
+            dict, host_os, timestamp, timestamp_frac, attr, intname,
+            end_flags,
+        errors) = parse_ref(ref)
         
         #~ with "sfv" as sfv:
             #~ get header
             #~ find ref name
-            
         
         print()
         
-        if parser.fail and not lenient:
+        if errors and not lenient:
             raise SystemExit()
         if is_dryrun:
             return
@@ -671,6 +345,347 @@ def get_timestamp(s):
     else:
         frac = float(frac)
     return (tm, frac)
+
+def parse_ref(ref):
+    with Parser(ref) as parser:
+        rls_name = os.path.basename(os.path.dirname(ref))
+        if not rls_name or rls_name.startswith("."):
+            rls_name = None
+        else:
+            parser.out("rls", rls_name)
+        version = None
+        
+        hdr = parser.read(len(RAR_ID))
+        if RAR_ID != hdr:
+            parser.die(0, "Invalid Rar marker")
+        
+        (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_MAIN, "Main",
+            RAR_MAIN_FIRSTVOLUME ^ RAR_MAIN_RECOVERY ^ RAR_MAIN_LOCK ^
+            RAR_MAIN_NEWNUMBERING, RAR_MAIN_VOLUME)
+        is_rr = bool(flags & RAR_MAIN_RECOVERY)
+        is_lock = bool(flags & RAR_MAIN_LOCK)
+        is_first = bool(flags & RAR_MAIN_FIRSTVOLUME)
+        if is_rr:
+            parser.out("rr")
+        if is_lock:
+            parser.out("lock")
+        
+        naming_version = 3 if flags & RAR_MAIN_NEWNUMBERING else 2
+        parser.out("naming{}".format(naming_version))
+        
+        if MAIN_HDR_SIZE != len(hdr):
+            parser.error(pos + HDR_SIZE_POS,
+                "Expected main block size 0x{:X}".format(MAIN_HDR_SIZE))
+        if any(x != 0 for x in hdr[S_BLK_HDR.size:]):
+            parser.error(pos + S_BLK_HDR.size,
+                "Expected zeroed main block data")
+        
+        (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_FILE,  "File",
+            RAR_FILE_SPLIT_BEFORE ^ RAR_FILE_SPLIT_AFTER ^
+            RAR_FILE_UNICODE ^ RAR_FILE_EXTTIME ^ RAR_FILE_DICTMASK,
+            RAR_LONG_BLOCK)
+        is_unicode = bool(flags & RAR_FILE_UNICODE)
+        split_before = bool(flags & RAR_FILE_SPLIT_BEFORE)
+        split_after = bool(flags & RAR_FILE_SPLIT_AFTER)
+        dict = flags & RAR_FILE_DICTMASK
+        
+        dict_size = DICT_MIN << (dict >> DICT_POS)
+        if dict_size > DICT_MAX:
+            parser.error(pos + HDR_FLAGS_POS, "Unexpected dictionary "
+                "size in flags: 0x{:02X}".format(dict))
+        
+        hdr_pos = S_BLK_HDR.size
+        
+        if is_unicode:
+            parser.out("unicode")
+        
+        (pack_size, data_size, host_os, file_crc, timestamp, rar_ver,
+            compress, name_size, attr) = (
+            S_FILE_HDR.unpack_from(hdr, hdr_pos))
+        
+        if RAR_OS_UNIX == host_os:
+            parser.out("unix")
+        elif RAR_OS_WIN32 != host_os:
+            parser.error(pos + hdr_pos + FILE_OS_POS,
+                "Expected Windows OS")
+        
+        timestamp = [
+            1980 + (timestamp >> DOS_YEAR_BIT & bitmask(DOS_YEAR_BITS)),
+            timestamp >> DOS_MONTH_BIT & bitmask(DOS_MONTH_BITS),
+            timestamp >> DOS_DAY_BIT & bitmask(DOS_DAY_BITS),
+            timestamp >> DOS_HOUR_BIT & bitmask(DOS_HOUR_BITS),
+            timestamp >> DOS_MIN_BIT & bitmask(DOS_MIN_BITS),
+            (timestamp >> DOS_2SEC_BIT & bitmask(DOS_2SEC_BITS)) << 1,
+        ]
+        timestamp_frac = 0
+        
+        if 20 != rar_ver:
+            parser.error(pos + hdr_pos + FILE_VER_POS,
+                "Expected Rar version 2.0")
+        if ord("0") != compress:
+            parser.error(pos + hdr_pos + FILE_METHOD_POS,
+                "Compression used")
+        if 1 << ATTR_NORMAL == attr:
+            parser.out("normalattr")
+        elif 1 << ATTR_ARCHIVE != attr:
+            parser.error(pos + hdr_pos + FILE_ATTR_POS,
+                "Unexpected file attributes: 0x{:08X}".format(attr))
+        
+        hdr_pos += S_FILE_HDR.size
+        
+        if flags & RAR_FILE_LARGE:
+            parser.die(pos + HDR_FLAGS_POS, "Large file not supported")
+        
+        name_field = hdr[hdr_pos:][:name_size]
+        
+        if not flags & RAR_FILE_UNICODE:
+            intname = name_field.decode("latin-1")
+        else:
+            intname = name_field[:name_field.index(bytes((0,)))].decode(
+                "latin-1")
+            if encode_filename(intname, True) != name_field:
+                parser.error(pos + hdr_pos + len(intname) + 1,
+                    "Unexpected filename encoding")
+        parser.out("internal", intname)
+        hdr_pos += name_size
+        
+        if flags & RAR_FILE_SALT:
+            parser.die(pos + HDR_FLAGS_POS, "Salt not supported")
+        
+        if flags & RAR_FILE_EXTTIME:
+            (xtime_flags,) = S_SHORT.unpack_from(hdr, hdr_pos)
+            if (xtime_flags & ~((
+                1 << TIME_ONE_BIT ^
+                bitmask(TIME_SIZE_BITS) << TIME_SIZE_BIT
+            ) << MTIME_INDEX * TIME_FLAG_BITS) !=
+            1 << TIME_VALID_BIT << MTIME_INDEX * TIME_FLAG_BITS):
+                parser.die(pos + hdr_pos, "Unsupported extended time")
+            
+            xtime_flags = (xtime_flags >> MTIME_INDEX * TIME_FLAG_BITS &
+                bitmask(TIME_FLAG_BITS))
+            if not xtime_flags & (
+                1 << TIME_ONE_BIT |
+                bitmask(TIME_SIZE_BITS) << TIME_SIZE_BIT
+            ):
+                parser.error(pos + hdr_pos, "Unneeded extended time")
+            
+            # Seconds field
+            timestamp[5] |= xtime_flags >> TIME_ONE_BIT & 1
+            
+            hdr_pos += 2
+            
+            size = xtime_flags >> TIME_SIZE_BIT & bitmask(TIME_SIZE_BITS)
+            for place in range(TIME_FRAC_BYTES - size, TIME_FRAC_BYTES):
+                timestamp_frac |= hdr[hdr_pos] << BYTE_BITS * place
+                hdr_pos += 1
+            timestamp_frac /= 10 ** TIME_FRAC_DIGITS
+        
+        timestamp = time.struct_time(tuple(timestamp) + (0, 0, 0))
+        parser.out("time", time.strftime("%Y-%m-%d %H:%M:%S", timestamp))
+        if timestamp_frac:
+            print(".{:0{digits}}".format(round(timestamp_frac * 10 **
+                TIME_FRAC_DIGITS), digits=TIME_FRAC_DIGITS), end="")
+        
+        if hdr_pos != len(hdr):
+            parser.error(pos + hdr_pos, "Excess file block header "
+                "length: {}".format(len(hdr) - hdr_pos))
+        
+        print("{}: Size: {}".format(intname, fmt_size(data_size)),
+            end="", file=sys.stderr)
+        sys.stderr.flush()
+        if not split_after:
+            left = pack_size
+            while left > 0:
+                left -= len(parser.read(min(FILE_CRC_BUF, left)))
+            
+            print(" CRC: {:08X}".format(file_crc), end="",
+                file=sys.stderr)
+        else:
+            calc_crc = file_crc32(parser, pack_size)
+            if file_crc != calc_crc:
+                parser.error(pos + len(hdr),
+                    "CRC mismatch; calculated 0x{:08X}".format(calc_crc))
+        print(file=sys.stderr)
+        
+        if is_rr:
+            (pos, hdr, type, flags) = parser.read_block()
+            if RAR_BLOCK_OLD_RECOVERY == type:
+                version = 2
+                parser.expect_flags(pos, "Rar 2 RR", flags, 0,
+                    RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN)
+                hdr_pos = S_BLK_HDR.size
+                
+                (data_size,) = S_LONG.unpack_from(hdr, hdr_pos)
+                hdr_pos += S_LONG.size
+                
+                if 20 != hdr[hdr_pos]:
+                    parser.error(pos + hdr_pos,
+                        "Expected Rar version 2.0")
+                hdr_pos += 1
+                
+                (rr_count,) = S_SHORT.unpack_from(hdr, hdr_pos)
+                hdr_pos += S_SHORT.size
+                
+                (prot_sect_count,) = S_LONG.unpack_from(hdr, hdr_pos)
+                hdr_pos += S_LONG.size
+                
+                if RR_PROTECT_2 != hdr[hdr_pos:][:len(RR_PROTECT_2)]:
+                    parser.error(pos + hdr_pos,
+                        'Expected "{}"'.format(RR_PROTECT_2))
+                hdr_pos += len(RR_PROTECT_2)
+                
+                parser.expect_rr(pos, data_size, rr_count,
+                    prot_sect_count, hdr, hdr_pos)
+            elif RAR_BLOCK_SUB == type:
+                version = 3
+                parser.expect_flags(pos, "Sub", flags, 0,
+                    RAR_LONG_BLOCK ^ RAR_SKIP_IF_UNKNOWN)
+                hdr_pos = S_BLK_HDR.size
+                
+                (pack_size, data_size, sub_os, file_crc, sub_time,
+                    rar_ver, compress, name_size, sub_attr) = (
+                    S_FILE_HDR.unpack_from(hdr, hdr_pos))
+                
+                if 0 != sub_time or 0 != sub_attr:
+                    parser.error(pos + hdr_pos, "Expected zero sub-"
+                        "block timestamp and file attributes")
+                if 29 != rar_ver:
+                    parser.error(pos + hdr_pos + FILE_VER_POS,
+                        "Expected Rar version 2.9")
+                if host_os != sub_os:
+                    parser.error(pos + hdr_pos + FILE_OS_POS,
+                        "Sub-block ({}) and file ({}) OSes do not match".
+                        format(sub_os, host_os))
+                if ord("0") != compress:
+                    parser.die(pos + hdr_pos + FILE_METHOD_POS,
+                        "Compression used")
+                if pack_size != data_size:
+                    parser.error(pos + hdr_pos + FILE_PACK_POS, "Sub-"
+                        "block packed size does not match unpacked size")
+                
+                hdr_pos += S_FILE_HDR.size
+                if RR_SUB_NAME != hdr[hdr_pos:][:name_size]:
+                    parser.die(pos + hdr_pos, "Expected RR sub-block")
+                hdr_pos += name_size
+                
+                if RR_PROTECT_3 != hdr[hdr_pos:][:len(RR_PROTECT_3)]:
+                    parser.error(pos + hdr_pos,
+                        'Expected "{}"'.format(RR_PROTECT_3))
+                hdr_pos += len(RR_PROTECT_3)
+                
+                (rr_count,) = S_LONG.unpack_from(hdr, hdr_pos)
+                hdr_pos += S_LONG.size
+                
+                (prot_sect_count,) = struct.unpack_from("<Q", hdr,
+                    hdr_pos)
+                hdr_pos += 8
+                
+                rr_block_crc = parser.expect_rr(pos, data_size, rr_count,
+                    prot_sect_count, hdr, hdr_pos)
+                
+                if file_crc != rr_block_crc:
+                    parser.error(parser.file.tell(),
+                        "RR block CRC mismatch; calculated 0x{:08X}".
+                        format(rr_block_crc))
+            else:
+                parser.die(pos, "Expected RR block")
+        
+        vol_crc = parser.vol_crc
+        (pos, hdr, type, flags) = parser.read_block()
+        this_version = 3 if hdr else 2
+        if version is not None and this_version != version:
+            parser.error(pos, "Unexpected end block presence for Rar {}".
+                format(version))
+        else:
+            version = this_version
+        
+        if hdr:
+            parser.expect_type(pos, type, RAR_BLOCK_ENDARC, "End")
+            parser.expect_flags(pos, "End", flags,
+                RAR_ENDARC_NEXT_VOLUME ^ RAR_ENDARC_DATACRC ^
+                RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR,
+                RAR_SKIP_IF_UNKNOWN)
+            next_volume = bool(flags & RAR_ENDARC_NEXT_VOLUME)
+            
+            if next_volume != split_after:
+                parser.error(pos + HDR_FLAGS_POS, "Split after ({}) and "
+                    "next volume ({}) flags to not match".format
+                    (split_after, next_volume))
+            
+            end_flags = flags & (RAR_ENDARC_DATACRC ^
+                RAR_ENDARC_REVSPACE ^ RAR_ENDARC_VOLNR)
+            if RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE == end_flags:
+                parser.out("nonum")
+            elif 0 == end_flags:
+                parser.out("blankend")
+            elif (RAR_ENDARC_DATACRC ^ RAR_ENDARC_REVSPACE ^
+            RAR_ENDARC_VOLNR != end_flags):
+                parser.error(pos + HDR_FLAGS_POS,
+                    "Unexpected end block flag combination 0x{:01X}".
+                    format(end_flags))
+            
+            hdr_pos = S_BLK_HDR.size
+            
+            if end_flags & RAR_ENDARC_DATACRC:
+                if S_LONG.unpack_from(hdr, hdr_pos) != (vol_crc,):
+                    parser.error(pos + hdr_pos, "Volume CRC mismatch; "
+                        "calculated 0x{:08X}".format(vol_crc))
+                hdr_pos += S_LONG.size
+            
+            if end_flags & RAR_ENDARC_VOLNR:
+                (volnum,) = S_SHORT.unpack_from(hdr, hdr_pos)
+                if (0 == volnum) != is_first:
+                    parser.error(pos + hdr_pos, "Volume number ({}) and "
+                        "first volume flag ({}) do not match".
+                        format(volnum, is_first))
+                #~ if volnum != Numbering(new_numbering).name(ref):
+                    
+                hdr_pos += S_SHORT.size
+            
+            if end_flags & RAR_ENDARC_REVSPACE:
+                if any(x != 0 for x in hdr[hdr_pos:][:END_EXTRA]):
+                    parser.error(pos + S_BLK_HDR.size,
+                        "Expected zeroed end block data")
+                hdr_pos += END_EXTRA
+            if hdr_pos != len(hdr):
+                parser.error(pos + HDR_SIZE_POS,
+                    "Unexpected extra end block data")
+            
+            pos = parser.file.tell()
+            if parser.read(1):
+                parser.error(pos, "Expected end of file")
+        
+        else:
+            end_flags = None
+        
+        if 3 != version:
+            parser.out("rar{}".format(version))
+        if version >= 3 and split_before != (not is_first):
+            parser.error(None, "Split before ({}) and first volume ({}) "
+                "flags do not correspond".format(split_before, is_first))
+        elif version < 3 and is_first:
+            parser.error(None,
+                "First volume flag set but not Rar 3 format")
+        if DICT_DEFAULT[version] != dict:
+            parser.out("dict", dict_size)
+        
+        print("Reference volume size:", fmt_size(pos), file=sys.stderr)
+        # print(first volume or volume number {})
+    
+    if not os.path.basename(ref).startswith(
+    os.path.splitext(intname)[0]):
+        print("{}: appears to have been renamed".format(ref),
+            file=sys.stderr)
+        parser.fail = True
+    
+    # Verify size against rr_count
+    # TODO: if not the final volume and RR doesn't introduce ambiguities,
+    # show volume size. Verify against specified volume size?
+    
+    return (
+        rls_name, version, is_rr, is_lock, naming_version, is_unicode, dict,
+        host_os, timestamp, timestamp_frac, attr, intname, end_flags,
+    parser.fail)
 
 class Parser:
     def __init__(self, file):
