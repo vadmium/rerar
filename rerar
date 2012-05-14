@@ -381,7 +381,7 @@ def parse_ref(ref):
                 "Expected zeroed main block data")
         
         (pos, hdr, flags) = parser.expect_block(RAR_BLOCK_FILE,  "File",
-            RAR_FILE_SPLIT_BEFORE ^ RAR_FILE_SPLIT_AFTER ^
+            RAR_FILE_SPLIT_BEFORE ^ RAR_FILE_SPLIT_AFTER ^ RAR_FILE_LARGE ^
             RAR_FILE_UNICODE ^ RAR_FILE_EXTTIME ^ RAR_FILE_DICTMASK,
             RAR_LONG_BLOCK)
         is_unicode = bool(flags & RAR_FILE_UNICODE)
@@ -434,7 +434,13 @@ def parse_ref(ref):
         hdr_pos += S_FILE_HDR.size
         
         if flags & RAR_FILE_LARGE:
-            parser.die(pos + HDR_FLAGS_POS, "Large file not supported")
+            (high,) = S_LONG.unpack_from(hdr, hdr_pos)
+            hdr_pos += S_LONG.size
+            pack_size += high << 32
+            (high,) = S_LONG.unpack_from(hdr, hdr_pos)
+            hdr_pos += S_LONG.size
+            data_size += high << 32
+            parser.error(pos + HDR_FLAGS_POS, "Large file not implemented")
         
         name_field = hdr[hdr_pos:][:name_size]
         
