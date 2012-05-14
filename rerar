@@ -683,7 +683,10 @@ class Parser:
         self.file.__exit__()
     
     def msg(self, pos, msg):
-        return "{}+0x{:X}: {}".format(self.file.name, pos, msg)
+        if pos is None:
+            return "{}: {}".format(self.file.name, msg)
+        else:
+            return "{}+0x{:X}: {}".format(self.file.name, pos, msg)
     
     def error(self, pos, msg):
         print(self.msg(pos, msg), file=sys.stderr)
