@@ -200,8 +200,7 @@ size <size>
 unix\tSet OS to Unix (instead of Windows)
 lenient\tIgnore problems with the reference file
 overwrite
-\tAllow writing to release directory that already exists
-""")
+\tAllow writing to release directory that already exists""")
 #~ time +/-s.sssssss\tAdjust data file timestamp
 #~ M specifies units of 10^6. (TODO: Use scene rules for default.)
         return
