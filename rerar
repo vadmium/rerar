@@ -989,6 +989,8 @@ def file_crc32(file, size):
     crc = 0
     while size > 0:
         chunk = file.read(min(FILE_CRC_BUF, size))
+        if not chunk:
+            raise EOFError()
         size -= len(chunk)
         crc = crc32(chunk, crc)
     return crc
