@@ -6,7 +6,7 @@ FILE_CRC_BUF = 0x10000
 
 from binascii import crc32
 from rar import (
-    S_BLK_HDR, S_FILE_HDR, S_SHORT, S_LONG,
+    S_BLK_HDR, S_FILE_HDR, S_SHORT, S_LONG, S_HIGH_SIZE,
     RAR_ID,
     RAR_BLOCK_MAIN, RAR_BLOCK_FILE, RAR_BLOCK_SUB, RAR_BLOCK_ENDARC,
     RAR_BLOCK_OLD_RECOVERY,
@@ -22,7 +22,7 @@ from rar import (
     write_file, file_hdr_size,
     FILE_PACK_POS, FILE_OS_POS, FILE_VER_POS, FILE_VER_POS, FILE_ATTR_POS,
     DICT_DEFAULT, DICT_MIN, DICT_MAX, DICT_POS,
-    filename_encode, time_encode,
+    filename_encode, time_encode, size_64_encode,
     DOS_2SEC_BIT, DOS_2SEC_BITS, DOS_MIN_BIT, DOS_MIN_BITS,
     DOS_HOUR_BIT, DOS_HOUR_BITS, DOS_DAY_BIT, DOS_DAY_BITS,
     DOS_MONTH_BIT, DOS_MONTH_BITS, DOS_YEAR_BIT, DOS_YEAR_BITS,
@@ -262,8 +262,9 @@ Try "{} help".""".format(sys.argv[0]))
         rr_max = calc_rr_count(version, vol_max, vol_max)
         data_max = calc_prot_size(version, data_max, rr_max)
     
-    data_max -= (len(RAR_ID) + MAIN_HDR_SIZE +
-        file_hdr_size(name_field, xtime_field))
+    data_max -= len(RAR_ID) + MAIN_HDR_SIZE
+    size_64 = size_64_encode(0, file_size)
+    data_max -= file_hdr_size(name_field, xtime_field, size_64)
     
     vol_count = quanta(file_size, data_max)
     if base is None:
@@ -439,12 +440,10 @@ def parse_ref(ref):
         hdr_pos += S_FILE_HDR.size
         
         if flags & RAR_FILE_LARGE:
-            (high,) = S_LONG.unpack_from(hdr, hdr_pos)
-            hdr_pos += S_LONG.size
-            pack_size += high << 32
-            (high,) = S_LONG.unpack_from(hdr, hdr_pos)
-            hdr_pos += S_LONG.size
-            data_size += high << 32
+            (high_pack, high_data) = S_HIGH_SIZE.unpack_from(hdr, hdr_pos)
+            hdr_pos += S_HIGH_SIZE.size
+            pack_size += high_pack << 32
+            data_size += high_data << 32
             parser.error(pos + HDR_FLAGS_POS, "Large file not implemented")
         
         name_field = hdr[hdr_pos:][:name_size]
@@ -897,7 +896,9 @@ class DryVolWriter:
         
     def write_file(self, split_before, split_after, name, is_unicode, dict,
     attr, dostime, xtime, file_size, data_size):
-        self.size += file_hdr_size(name, xtime) + data_size
+        size_64 = size_64_encode(data_size, file_size)
+        self.size += file_hdr_size(name, xtime, size_64)
+        self.size += data_size
     
     def write_rr(self, count):
         self.size += (RR_HEADER_SIZE[self.rls.version] +

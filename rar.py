@@ -56,7 +56,8 @@ MAIN_HDR_SIZE = S_BLK_HDR.size + RAR_MAIN_EXTRA
 def write_file(volume, file, split_before, split_after, name, is_unicode,
 dict, host_os, attr, accum_crc, dostime, xtime=None, size=None,
 pack_size=None):
-    header_size = file_hdr_size(name, xtime)
+    size_64 = size_64_encode(pack_size, size)
+    header_size = file_hdr_size(name, xtime, size_64)
     volume.seek(+header_size, io.SEEK_CUR)
     
     left = pack_size
@@ -69,14 +70,21 @@ pack_size=None):
         if split_after:
             accum_crc = crc32(chunk, accum_crc)
     
+    parts = list()
     flags = (RAR_LONG_BLOCK ^ split_before * RAR_FILE_SPLIT_BEFORE ^
         split_after * RAR_FILE_SPLIT_AFTER ^ dict ^
         is_unicode * RAR_FILE_UNICODE)
-    parts = [
-        S_FILE_HDR.pack(pack_size, size, host_os, crc, dostime, 20, ord("0"),
-            len(name), attr),
-        name,
-    ]
+    parts.append(S_FILE_HDR.pack(
+        pack_size & bitmask(32), size & bitmask(32),
+        host_os, crc, dostime, 20, ord("0"), len(name), attr
+    ))
+    
+    if size_64 is not None:
+        flags ^= RAR_FILE_LARGE
+        parts.append(size_64)
+    
+    parts.append(name)
+    
     if xtime is not None:
         flags ^= RAR_FILE_EXTTIME
         parts.append(xtime)
@@ -87,8 +95,10 @@ pack_size=None):
     
     if split_after: return accum_crc
 
-def file_hdr_size(name, xtime):
+def file_hdr_size(name, xtime, size_64):
     size = S_BLK_HDR.size + S_FILE_HDR.size + len(name)
+    if size_64 is not None:
+        size += len(size_64)
     if xtime is not None: size += len(xtime)
     return size
 
@@ -106,6 +116,13 @@ DICT_DEFAULT = {2: RAR_FILE_DICT256, 3: RAR_FILE_DICT4096}
 DICT_MIN = 64
 DICT_MAX = 4096
 DICT_POS = 5
+
+def size_64_encode(packed, unpacked):
+    if packed <= 1 << 31 and unpacked <= 1 << 31:
+        return None
+    return S_HIGH_SIZE.pack(packed >> 32, unpacked >> 32)
+
+S_HIGH_SIZE = Struct("<LL")
 
 def filename_encode(name, is_unicode):
     field = bytearray(name, "latin-1")
