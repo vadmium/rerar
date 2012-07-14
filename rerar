@@ -48,9 +48,6 @@ def main():
     # srr => Produce rescene file rather than Rar files
     # srr-rr-full => Do not strip Rar recovery records (older SRR file format). Requires srr and one of the rr options.
     # volume => Explicitly specify first, second, etc full volume name. Default is ".partN.rar" for "new" Rar 3 naming scheme, where the number of digits is automatically determined by the total number of volumes; and ".rar", ".r00", ".r01", etc, ".r99", ".s00", etc, ".s99" or ".001", ".002", etc, for the "old" naming scheme.
-    # base => Base output name, appended with ".sfv", ".partN" and/or ".rar" as appropriate. Default is the base name of the data file internal name with extension removed.
-    # naming-old => Force "old" volume naming scheme
-    # Default: Automatically choose "old" or "new" Rar 3 volume naming scheme depending on the number of volumes needed. More than 101 invokes the "new" Rar 3 scheme.
     # Option to only do the first volume, the first few volumes, or any given set of volumes?
     
     help = False
@@ -74,6 +71,7 @@ def main():
     host_os = RAR_OS_WIN32
     lenient = False
     overwrite = False
+    base = None
     
     i = 1
     while i < len(sys.argv):
@@ -160,6 +158,9 @@ def main():
         elif "overwrite" == arg:
             overwrite = True
             i += 1
+        elif "base" == arg:
+            base = sys.argv[i + 1]
+            i += 2
         else:
             raise SystemExit('''Bad command line argument: {}
 Try "{} help"'''.format(arg, sys.argv[0]))
@@ -200,7 +201,11 @@ size <size>
 unix\tSet OS to Unix (instead of Windows)
 lenient\tIgnore problems with the reference file
 overwrite
-\tAllow writing to release directory that already exists""")
+\tAllow writing to release directory that already exists
+base <grp-name>
+\tBase output name, appended with ".sfv", ".partN" and ".rar" as
+\tappropriate. Default is the base name of the internal data file name
+\twith extension removed.""")
 #~ time +/-s.sssssss\tAdjust data file timestamp
 #~ M specifies units of 10^6. (TODO: Use scene rules for default.)
         return
@@ -261,7 +266,8 @@ Try "{} help".""".format(sys.argv[0]))
         file_hdr_size(name_field, xtime_field))
     
     vol_count = quanta(file_size, data_max)
-    base = os.path.splitext(intname)[0]
+    if base is None:
+        base = os.path.splitext(intname)[0]
     vol_digits = 1 + int(math.log10(vol_count - 1))
     sfv_name = "{}.sfv".format(base)
     rls_size = 0
