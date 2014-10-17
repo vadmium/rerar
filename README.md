@@ -11,5 +11,5 @@ Sam Hocevar. See the [COPYING](COPYING) file for details.
 
 ## Dependencies ##
 
-* Python, <https://www.python.org/>
-* Python _rarfile_ module, <http://pypi.python.org/pypi/rarfile>
+* Python 3, <https://www.python.org/>
+* The Python _rarfile_ module, <https://pypi.python.org/pypi/rarfile>
